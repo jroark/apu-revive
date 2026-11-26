@@ -802,3 +802,20 @@ Logs: `re/traces/b9513_ms_erase.txt`, `b9513_ms_write.txt`, `b9513_restored_vm*.
 So: the erase path, the row-programming path and the read path are all confirmed on hardware,
 and a chip that could not be identified is now a blank, identifiable EPM7160E (carrying its
 sibling's ID and parameter codes). The other non-identifying chips may be in the same state.
+
+## FIRST FULL PROGRAM: B9550's image written into B9513 (2026-11-25)
+`tools/program_image.py EPM7160ELC84-15 re/traces/bulk_7160e_examine.json --yes-really-program`
+- Pre-check: chip blank (2 masked-bit cells), ID `ALTERA93`.
+- pgm.dll's ID check passed and gave Vpp 12250, Tprogram 60; calibration 16500.
+  `program_setup(3, 60, 4750, 2000, 12250, 0)`, then for each of the 159 lines with data:
+  `set_column_address(row)`; `pgd_program_bytes_on_column(0, width, mask, data, 0, 0)`.
+  All calls returned 1; 11 s in total.
+- Read back at 1000 and 2500 mV margin: the two reads are identical in all 8416 cells.
+- Against the source image: bits 0–8 match in every one of the 8416 cells (no bit that should
+  be 0 reads 1, none that should be 1 reads 0); 3472 cells with data in both.
+- Bit 9 (0x200) cannot be verified on this chip: it reads 0 in all but 160 cells whether the chip
+  is blank or programmed (source image: set in 6661 cells). On B9550 that bit is live when
+  row 0 is read first. Whether B9513's bit-9 plane is defective, or whether it depends on
+  something in row 0 that was not copied (bits 8–9 of row 0 were left unprogrammed), is unknown.
+  The device has about 7,460 fuses on that bit.
+Logs: `re/traces/b9513_program.txt`, `b9513_programmed_vm*.json`.
