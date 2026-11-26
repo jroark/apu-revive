@@ -36,6 +36,284 @@ def cmd_adapter(args):
     print("adapter ID %d (%#x): %s" % (aid, aid, board.KNOWN_ADAPTERS.get(aid, "unknown")))
 
 
+DEVICE_FILES = {"EPM7160E": "e7160084.pcf", "EPM7064": "m7064084.pcf", "EPM7032": "m7032044.pcf"}
+
+
+def _open_for(args):
+    """Bring the unit up and return (apu, profile, device file) for --part."""
+    from . import board, programmer
+    from .device import Apu
+    from .pcf import Pcf
+    profile = programmer.PROFILES.get(args.part.upper())
+    if profile is None:
+        sys.exit("no native support for %r (have: %s)" % (args.part, ", ".join(programmer.PROFILES)))
+    if not profile.verified and not args.allow_unverified:
+        sys.exit("%s is checked against the vendor module in simulation only and has not been run on a "
+                 "chip; pass --allow-unverified to try it" % profile.name)
+    vendor = pathlib.Path(args.vendor)
+    args.pcf = str(args.pcf or vendor.parent / "7k" / DEVICE_FILES[profile.name])
+    pcf = Pcf.load(args.pcf)
+    apu = Apu.open()
+    apu.load_firmware((vendor / "pgdmpuz.drv").read_bytes())
+    apu.configure_fpga((vendor / "pgdmpuz.rbf").read_bytes())
+    programmer.initialise(apu)
+    if not apu.has_9v():
+        sys.exit("no 9 V supply")
+    aid = board.adapter_id(apu)
+    if aid not in profile.adapters:
+        sys.exit("adapter ID %d is not one this device is supported on (%s)" % (aid, profile.adapters))
+    return apu, profile, pcf
+
+
+def cmd_id(args):
+    from . import programmer
+    apu, profile, pcf = _open_for(args)
+    sig = programmer.silicon_id(apu, profile, pcf)
+    print("silicon ID %r, following signature bytes %s" % (sig[:8].decode("latin1"), sig[8:].hex(" ")))
+
+
+def cmd_read(args):
+    import json
+    from . import programmer
+    apu, profile, pcf = _open_for(args)
+    sig, rows = programmer.read_back(apu, profile, pcf, vmarg_mv=args.vmarg)
+    id_row = programmer.signature_row(pcf)
+    out = {"part": profile.name, "pcf": args.pcf,
+           "method": "native", "bits_per_call": 16, "vmarg_mv": args.vmarg,
+           "silicon_id": sig[:8].decode("latin1"), "signature_row": id_row,
+           "rows": {"%#04x" % r: {"col": 0, "data": cells} for r, cells in rows.items()}}
+    pathlib.Path(args.out).write_text(json.dumps(out))
+    print("silicon ID %r, %d rows, %d cells -> %s" % (out["silicon_id"], len(rows), sum(map(len, rows.values())), args.out))
+
+
+def cmd_pof(args):
+    from . import pof
+    p = pof.Pof.from_bytes(pathlib.Path(args.file).read_bytes())
+    print("creator %r, device %r, comment %r" % (p.creator, p.device, p.comment))
+    print("security bit %s, turbo bit %s, CRC %s" % (p.flag(pof.TAG_SECURITY), p.flag(pof.TAG_TURBO),
+                                                     "ok" if p.crc_ok else "BAD or missing"))
+    for tag, payload in p.packets:
+        print("  packet %-28s %d bytes" % (pof.TAG_NAMES.get(tag, "tag %d" % tag), len(payload)))
+    for e in p.electrical():
+        print("  electrical: lines %d..%d, cells %d..%d, mask %#x, kind %#x" % (
+            e.start_col, e.start_col + e.col_count - 1, e.start_row, e.start_row + e.row_count - 1, e.mask, e.flags))
+
+
+def cmd_topof(args):
+    import json
+    from . import pof
+    from .pcf import Pcf
+    dump = json.loads(pathlib.Path(args.image).read_text())
+    rows = {int(k, 16): v["data"] for k, v in dump["rows"].items()}
+    p = pof.image_to_pof(Pcf.load(args.pcf or dump["pcf"]).regions, rows, args.device or dump.get("part", ""))
+    pathlib.Path(args.out).write_bytes(p.to_bytes())
+    print("wrote %s: %d electrical packets" % (args.out, len(p.electrical())))
+
+
+def _load_image(path, pcf):
+    """Image {row: [cells]} from a .json read-back, a .pof or a JEDEC file."""
+    import json
+    from . import jedec, pof
+    raw = pathlib.Path(path).read_bytes()
+    if raw[:4] == b"POF\0":
+        p = pof.Pof.from_bytes(raw)
+        if p.crc_ok is False:
+            sys.exit("POF checksum is wrong")
+        return pof.pof_to_image(p)
+    if raw[:1] == b"{":
+        return {int(k, 16): v["data"] for k, v in json.loads(raw)["rows"].items()}
+    j = jedec.parse(raw.decode("latin1"))
+    if j["checksum_ok"] is False:
+        sys.exit("JEDEC fuse checksum is wrong")
+    return jedec.image_from_fuses(pcf, j["fuses"])
+
+
+def cmd_program(args):
+    from . import programmer
+    from .pcf import Pcf
+    profile = programmer.PROFILES.get(args.part.upper())
+    if profile is None or profile.name != "EPM7160E":
+        sys.exit("native programming exists only for the EPM7160E")
+    vendor = pathlib.Path(args.vendor)
+    args.pcf = str(args.pcf or vendor.parent / "7k" / DEVICE_FILES[profile.name])
+    pcf = Pcf.load(args.pcf)
+    image = _load_image(args.file, pcf)
+    plan = programmer.plan_program(pcf, image)
+    zeros = sum(bin(~c & 0x3FF).count("1") for cells in plan.values() for c in cells)
+    print("%s: %d of %d lines to write, %d bits to program, %d ms per line at Vpp %d mV (about %d s)" % (
+        args.file, len(plan), len(programmer.cell_masks(pcf)), zeros, args.tprog_ms, args.vpp_mv,
+        len(plan) * (args.tprog_ms + 30) // 1000 + 1))
+    if not args.yes_really_program:
+        print("dry run: nothing sent to the unit. Pass --yes-really-program to write the chip. "
+              "Programming only clears bits; erase first if the chip is not blank.")
+        return
+    args.allow_unverified = True
+    apu, profile, pcf = _open_for(args)
+    try:
+        programmer.supply_on(apu, profile=profile)
+        programmer.program_epm7160e(apu, plan, tprog_ms=args.tprog_ms, vpp_mv=args.vpp_mv)
+    finally:
+        programmer.shutdown(apu, profile)
+    sig, got = programmer.read_back(apu, profile, pcf)
+    bad = programmer.verify(pcf, image, got)
+    print("verify: %d cells differ%s" % (len(bad), "" if not bad else "; first: %s" % (bad[:5],)))
+    sys.exit(1 if bad else 0)
+
+
+def cmd_fuses(args):
+    from . import daf, fusemap, jedec
+    j = jedec.parse(pathlib.Path(args.jed).read_bytes().decode("latin1"))
+    from . import maf
+    arch = maf.parse(pathlib.Path(args.maf).read_bytes()) if args.maf and pathlib.Path(args.maf).exists() else None
+    fmap = fusemap.FuseMap(daf.parse(pathlib.Path(args.daf).read_bytes()), arch)
+    print(fmap.report(j["fuses"]))
+
+
+def cmd_ahdl(args):
+    import itertools
+    from . import ahdl, ahdl_eval
+    text = pathlib.Path(args.file).read_text(encoding="latin1")
+    try:
+        sub = ahdl.parse(text)[5]
+    except ahdl.AhdlError as e:
+        sys.exit("%s: %s" % (args.file, e))
+    print("SUBDESIGN %s: %d port declarations, %d variable declarations, %d statements" % (
+        sub[1], len(sub[2]), len(sub[3]), len(sub[4])))
+    try:
+        resolver = ahdl_eval.directory_resolver(pathlib.Path(args.file).parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR))
+        design = ahdl_eval.Design(text, resolver)
+        if design.flops:
+            raise ahdl_eval.Unsupported("registers")
+        if len(design.inputs) > 8:
+            print("combinational; %d inputs is too many to tabulate" % len(design.inputs))
+            return
+        print(" ".join(design.inputs), "|", " ".join(design.outputs))
+        for values in itertools.product((0, 1), repeat=len(design.inputs)):
+            out = design.evaluate(**dict(zip(design.inputs, values)))
+            print(" ".join(str(v).rjust(len(n)) for v, n in zip(values, design.inputs)), "|",
+                  " ".join(str(out[n]).rjust(len(n)) for n in design.outputs))
+    except ahdl_eval.Unsupported as e:
+        try:
+            sim = ahdl_eval.Simulator(text, ahdl_eval.directory_resolver(pathlib.Path(args.file).parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR)))
+            d = sim.design
+            print("sequential: %d register bits, state machines: %s; can be simulated (apu.ahdl_eval.Simulator)" % (
+                len(d.flops), ", ".join(d.machines) or "none"))
+        except ahdl_eval.Unsupported as e2:
+            print("parses, but cannot be evaluated yet: %s" % e2)
+
+
+def cmd_synth(args):
+    from . import ahdl, ahdl_eval, synth
+    text = pathlib.Path(args.file).read_text(encoding="latin1")
+    try:
+        net = synth.synthesise(text, ahdl_eval.directory_resolver(pathlib.Path(args.file).parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR)))
+    except (ahdl.AhdlError, ahdl_eval.Unsupported, synth.TooLarge) as e:
+        sys.exit("%s: %s" % (args.file, e))
+    print(net.report())
+    terms = [len(eq.terms) for eq in net.outputs.values()] + [len((r.get("d") or r["t"]).terms) for r in net.registers.values()]
+    print("-- %d outputs, %d register bits, largest equation %d product terms" % (
+        len(net.outputs), len(net.registers), max(terms or [0])))
+
+
+FIT_DEVICES = {"EPM7032": "m7032044.daf", "EPM7064": "m7064084.daf", "EPM7096": "m7096084.daf",
+               "EPM7128": "m7128084.daf", "EPM7160E": "e7160084.daf"}
+
+
+def cmd_fit(args):
+    from . import ahdl, ahdl_eval, daf, fit, synth
+    text = pathlib.Path(args.file).read_text(encoding="latin1")
+    name = args.device.upper()
+    if name not in FIT_DEVICES:
+        sys.exit("unknown device %s (have: %s)" % (args.device, ", ".join(FIT_DEVICES)))
+    info = daf.summary(daf.parse((DEFAULT_VENDOR.parent / "7k" / FIT_DEVICES[name]).read_bytes()))
+    try:
+        net = synth.synthesise(text, ahdl_eval.directory_resolver(pathlib.Path(args.file).parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR)))
+        result = fit.fit(net, name, info["macrocells"])
+    except (ahdl.AhdlError, ahdl_eval.Unsupported, synth.TooLarge, fit.DoesNotFit) as e:
+        sys.exit("%s: %s" % (args.file, e))
+    print(result.report())
+    try:
+        device_file = daf.parse((DEFAULT_VENDOR.parent / "7k" / FIT_DEVICES[name]).read_bytes())
+        placement, pins = fit.assign_pins(result, net, device_file.tables["pin_mc"])
+        print("pins: " + ", ".join("%s=%d" % (n, p) for n, p in sorted(pins.items(), key=lambda kv: kv[1])))
+    except fit.DoesNotFit as e:
+        print("pin assignment failed: %s" % e)
+    print("-- resource fit only: signals are not routed and no programming file is produced")
+
+
+def cmd_sim(args):
+    import re
+    from . import ahdl, ahdl_eval, gdf, tbl
+    path = pathlib.Path(args.design)
+    resolver = ahdl_eval.directory_resolver(path.parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR))
+    try:
+        text = gdf.to_ahdl(path.read_bytes(), path.stem) if path.suffix.lower() == ".gdf" else \
+            path.read_text(encoding="latin1")
+        sim = ahdl_eval.Simulator(text, resolver)
+    except (ahdl.AhdlError, ahdl_eval.Unsupported, gdf.GdfError) as e:
+        sys.exit("%s: %s" % (path, e))
+    table = tbl.parse(pathlib.Path(args.tbl).read_text(encoding="latin1"))
+    rename = lambda n: re.sub(r"\|[\w~]+:(\d+)\|", r"u\1/", n).lstrip("|")
+    checks, mismatches = tbl.compare(table, sim, rename, table.outputs + table.buried)
+    for time, name, want, got in mismatches[:40]:
+        print("%8.1f ns  %-30s expected %s, got %s" % (time, name, want, got))
+    print("%d values compared, %d differ" % (checks, len(mismatches)))
+    sys.exit(1 if mismatches else 0)
+
+
+def cmd_gui(args):
+    from . import gui
+    server = gui.serve(args.project, args.vendor, args.port, open_browser=not args.no_browser)
+    print("apu-revive is running at %s  (Ctrl-C to stop)" % server.url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def _pcf_for(args, device=None):
+    """Device file: --pcf, or looked up from the device name in the vendor part table."""
+    from .pcf import Pcf
+    if getattr(args, "pcf", None):
+        return Pcf.load(args.pcf)
+    name = (getattr(args, "device", None) or device or "").strip()
+    table = DEFAULT_VENDOR / "partinfo.crf"
+    for line in table.read_text(errors="replace").splitlines() if table.exists() else []:
+        cols = line.split()
+        if len(cols) > 2 and cols[0].upper() == name.upper():
+            hits = sorted(DEFAULT_VENDOR.parent.glob("*/%s.pcf" % cols[1].lower()))
+            if hits:
+                return Pcf.load(hits[0])
+    sys.exit("cannot find a device file for %r; pass --pcf" % name)
+
+
+def cmd_pof2jed(args):
+    from . import jedec, pof
+    p = pof.Pof.from_bytes(pathlib.Path(args.pof).read_bytes())
+    if p.crc_ok is False:
+        sys.exit("POF checksum is wrong")
+    pcf = _pcf_for(args, p.device)
+    fuses = jedec.fuses_from_image(pcf, pof.pof_to_image(p))
+    text = jedec.write(fuses, "Converted from %s" % pathlib.Path(args.pof).name, device=p.device,
+                       security=p.flag(pof.TAG_SECURITY))
+    pathlib.Path(args.jed).write_bytes(text.encode("latin1"))
+    print("%d fuses, %d set -> %s" % (len(fuses), sum(fuses), args.jed))
+
+
+def cmd_jed2pof(args):
+    from . import jedec, pof
+    j = jedec.parse(pathlib.Path(args.jed).read_bytes().decode("latin1"))
+    if j["checksum_ok"] is False:
+        sys.exit("JEDEC fuse checksum is wrong")
+    device = args.device or j["device"] or ""
+    pcf = _pcf_for(args, device)
+    p = pof.image_to_pof(pcf.regions, jedec.image_from_fuses(pcf, j["fuses"]), device)
+    if j["security"] is not None:
+        p.add_flag(pof.TAG_SECURITY, j["security"])
+    pathlib.Path(args.pof).write_bytes(p.to_bytes())
+    print("%d fuses -> %s (%d electrical packets)" % (len(j["fuses"]), args.pof, len(p.electrical())))
+
+
 def main():
     p = argparse.ArgumentParser(prog="apu")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -46,6 +324,74 @@ def main():
     a = sub.add_parser("adapter", help="read the fitted adapter's ID (native, no Altera code)")
     a.add_argument("--vendor", default=str(DEFAULT_VENDOR), help="dir containing pgdmpuz.drv/.rbf")
     a.set_defaults(fn=cmd_adapter)
+    for name, fn, text in (("id", cmd_id, "silicon ID (native, no Altera code)"),
+                           ("read", cmd_read, "full read-back to a JSON image (native)")):
+        c = sub.add_parser(name, help=text)
+        if name == "read":
+            c.add_argument("out", help="JSON file to write")
+            c.add_argument("--vmarg", type=int, default=2000, help="margin voltage in mV (default 2000)")
+        c.add_argument("--part", default="EPM7160E", help="device type: EPM7160E (default), EPM7064 or EPM7032")
+        c.add_argument("--pcf", help="device file (default: the 84-pin one for the part)")
+        c.add_argument("--allow-unverified", action="store_true",
+                       help="run a device whose native sequences have only been checked in simulation")
+        c.add_argument("--vendor", default=str(DEFAULT_VENDOR), help="dir containing pgdmpuz.drv/.rbf")
+        c.set_defaults(fn=fn)
+    g = sub.add_parser("program", help="program an EPM7160E from a .pof, JEDEC or image file (native; "
+                                       "sequences checked in simulation only)")
+    g.add_argument("file")
+    g.add_argument("--vpp-mv", type=int, required=True, help="programming voltage in mV (no default)")
+    g.add_argument("--tprog-ms", type=int, required=True, help="pulse time per line in ms (no default)")
+    g.add_argument("--part", default="EPM7160E")
+    g.add_argument("--pcf")
+    g.add_argument("--yes-really-program", action="store_true", help="actually write the chip")
+    g.add_argument("--vendor", default=str(DEFAULT_VENDOR))
+    g.set_defaults(fn=cmd_program)
+    u = sub.add_parser("fuses", help="listing of a JEDEC file: product terms, their roles and option fuses "
+                                     "(signal names for the EPM7032 only)")
+    u.add_argument("jed")
+    u.add_argument("--daf", default=str(DEFAULT_VENDOR.parent / "7k/m7032044.daf"), help="device assembler file")
+    u.add_argument("--maf", default=str(DEFAULT_VENDOR.parent / "7k/m7032.maf"), help="device architecture file")
+    u.set_defaults(fn=cmd_fuses)
+    h = sub.add_parser("ahdl", help="parse an AHDL (.tdf) design; print a truth table if it is purely "
+                                    "combinational and small")
+    h.add_argument("file")
+    h.set_defaults(fn=cmd_ahdl)
+    y = sub.add_parser("synth", help="reduce a small flat AHDL design to sum-of-products equations")
+    y.add_argument("file")
+    y.set_defaults(fn=cmd_synth)
+    z = sub.add_parser("fit", help="check that an AHDL design fits a device's macrocells and blocks "
+                                   "(no routing, no programming file)")
+    z.add_argument("file")
+    z.add_argument("--device", default="EPM7032")
+    z.set_defaults(fn=cmd_fit)
+    w = sub.add_parser("sim", help="simulate an AHDL or schematic design against a MAX+PLUS II simulator "
+                                   "table (.tbl) and report differences (functional, no delays)")
+    w.add_argument("design")
+    w.add_argument("tbl")
+    w.set_defaults(fn=cmd_sim)
+    g2 = sub.add_parser("gui", help="open the application in your browser (local only)")
+    g2.add_argument("project", nargs="?", default=".", help="directory holding the design files")
+    g2.add_argument("--port", type=int, default=0)
+    g2.add_argument("--no-browser", action="store_true")
+    g2.add_argument("--vendor", default=str(DEFAULT_VENDOR))
+    g2.set_defaults(fn=cmd_gui)
+    f = sub.add_parser("pof", help="describe a .pof programming file")
+    f.add_argument("file")
+    f.set_defaults(fn=cmd_pof)
+    t = sub.add_parser("topof", help="write a read-back image (JSON) as a .pof")
+    t.add_argument("image")
+    t.add_argument("out")
+    t.add_argument("--pcf", help="device file (default: the one named in the image)")
+    t.add_argument("--device", help="device name to record (default: the image's part)")
+    t.set_defaults(fn=cmd_topof)
+    for name, fn, a, b, text in (("pof2jed", cmd_pof2jed, "pof", "jed", "convert a .pof to a JEDEC file"),
+                                 ("jed2pof", cmd_jed2pof, "jed", "pof", "convert a JEDEC file to a .pof")):
+        c = sub.add_parser(name, help=text)
+        c.add_argument(a)
+        c.add_argument(b)
+        c.add_argument("--pcf", help="device file (default: found from the device name)")
+        c.add_argument("--device", help="device name (default: the one recorded in the input)")
+        c.set_defaults(fn=fn)
     args = p.parse_args()
     args.fn(args)
 

@@ -168,3 +168,18 @@ def read_rail(apu: Apu, name: str) -> float:
     """Approximate rail voltage in millivolts from the on-board ADC."""
     _, _, channel, mv_per_count = RAILS[name]
     return adc_read(apu, channel) * mv_per_count
+
+
+def vpd_code(millivolts: int) -> int:
+    """DAC code for the VPD rail as the module computes it (0x10018ae5): above 5 V the request is
+    raised by (mV - 5000) / 50 before conversion."""
+    if millivolts > 5000:
+        millivolts += (millivolts - 5000) // 50
+    return millivolts * 255 // 20000
+
+
+def vpg_code(millivolts: int) -> int:
+    """DAC code for the VPG rail (0x10018b21): above 5 V raised by (mV - 5000) / 12."""
+    if millivolts > 5000:
+        millivolts += (millivolts - 5000) // 12
+    return millivolts * 255 // 20000

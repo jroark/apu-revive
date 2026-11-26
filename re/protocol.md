@@ -955,3 +955,872 @@ returned on that chip. `apu/max7000.py` implements it (unit test with those valu
 So the ID and parameter codes are bit planes of the signature row; this also explains why
 copying the row's low bytes to B9513 restored its ID.
 (An older group, types 0x0a–0x15 with flag 0x1003a208 = 0, uses bit k // 10 of cells 8k … 8k+7.)
+
+## Native line read for the EPM7160E, verified on hardware (2026-11-26)
+`apu/max7000.py: line_read_ops(row, first)` reproduces the module's port operations for a line
+read op for op (rows 0, 1, 5, 0x69 in simulation; unit test holds the digests). Structure:
+1. delay (first read after a voltage set-up: port 1 = C0, 749 no-ops, port 1 = 00) or, on later
+   reads, a line release (`14=0C 07=00 03=00 10=00`);
+2. row select: 110 clocks on port 3 bit 0 to flush a shift register, one marker bit
+   (`11=04 15=02`, one clock), then `row` more clocks;
+3. sixteen identical 30-write precharge blocks on ports 06/07/0C/0D/10/11/15;
+4. row 0: `03=08 10=20 03=88`; other rows: `07=04 03=80`; then two 74-no-op delays around `14=0D`;
+5. 80 clocks on port 3 bit 7, seven port reads (03 06 07 0C 10 12 15) after each; every 16 clocks
+   an interlude (`14=0C`, pulse port 0C bit 4, `14=0D`, each separated by a 74-no-op delay).
+Delays are `01=C0`, N no-op commands, `01=00`; N comes from the measured stream rate (16.5 µs per
+command here), so 74 ≈ 1.2 ms and 749 ≈ 12 ms.
+Cell bit ← port bit, fitted against the known signature row (corrects two entries noted earlier):
+bit 9 = 0C.0, 8 = 0C.5, 7 = 07.3, 6 = 06.0, 5 = 06.7, **4 = 15.4, 3 = 12.3**, 2 = 10.4, 1 = 03.1,
+0 = 03.5.
+Hardware check (`tools/native_line.py`; the module still selects the device and sets voltages,
+the read and decode are native), B9513 in the socket: ID `ALTERA93`, parameter bytes D7 80, and
+all 89 eighty-cell data rows (7120 cells) equal the stored image in bits 0–8. Not yet native:
+the 16-cell rows, device select / voltage set-up, and any write.
+Mixing native reads with module reads in one session upsets the module (its shadow of the port
+state goes stale); its next ID byte reads wrong. Not a native-code problem.
+
+## Fully native silicon-ID read (2026-11-26)
+`tools/capture_setup.py` records the module's traffic on the real unit per call (delays kept) and
+`tools/setup_decode.py` condenses it into DAC commands, ADC reads, delays and port writes.
+Findings:
+- Device select (`pgd_setup 6`) sends nothing.
+- Supply on (mode 0): `W5 00=F7`; adapter ID twice; DACs A0=45, B3=target, B0=B1=B2=0; `09=7E 09=00`;
+  B3=0; `00=10`; ramp B3 0…target, 5 no-ops apart; opcode-5 writes 03=80, 14=1C, others 0;
+  then the trim; `W5 00=F7`, `00=90`.
+- Trim (code 0x10006b80): start at mV·255/10000, raise one code at a time until ADC channel 4
+  reads ≥ min(mV·255/5000, 255). So **ADC channel 4 is the socket supply, 5 V full scale**. On this
+  unit 127 reads 254 and 128 reads 255, every time.
+- Read set-up (mode 1): rails (B0 = 154 for 12 V), trim, clear data ports, `0A=01`, delay, `0A=81`,
+  `W5 14=0C`, then the device's opcode-5 table (03=D9 04=FF 05=FF 06=7A 07=F5 0B=FF 0C=9C 0D=F7
+  0E=FF 0F=FF 10=AF 11=7C 12=F5 13=FF 14=EF 15=E3), 120 pulses of port 0C bit 4, trim again.
+- Shutdown and the end of initialisation share an idle sequence: rails to 0, every data port
+  (3–7, 0B–3F; not 8, 9, 0A) written 0 and opcode-5 FF. Initialisation also runs a walking-ones
+  self-test of the data ports.
+`apu/programmer.py` implements these. `python -m apu id` on B9513: `ALTERA93`, parameter bytes
+D7 80 FF FF, supply code 128, ADC shows VPD ≈ 12.0 V during the read and rails at 0 afterwards.
+No Altera code runs; the firmware and FPGA image loaded at start are still Altera's data.
+The native trim refuses to go more than 4 codes above nominal.
+
+## Fully native read-back of the EPM7160E (2026-11-26)
+- Sixteen-cell rows use the same line sequence stopped after 16 clocks; the cell index is 15 − s.
+- Rows 128 and up are selected through a second chain: marker `11=10 15=00`, then row − 128 clocks.
+- The examine (margin) set-up is the ID set-up with the margin DAC set (B2 = mV·255/10000); nothing
+  else differs on the wire.
+- The row layout comes from the device file (`programmer.data_rows`): rows 1–88 and 128 are 80
+  cells, rows 89–105 and 129–192 are 16 cells.
+`python -m apu read out.json` on B9513 (2.0 V and 1.0 V margin): 8416 data cells, identical in
+all ten bits to the hosted read-backs of the same chip (b9513_programmed_vm1000/2500), identical
+between the two margins, and the JEDEC file made from it has the same fuse data and fuse checksum as the hosted one; only the header comment naming the part differs, and with it the whole-file checksum on the last line.
+
+## Line write decoded in simulation (2026-11-26) — not yet run on a chip
+`tools/sim_capture.py` runs module calls with no device, delays kept. For the EPM7160E:
+- Row select as for a read (110 flush clocks, marker, row clocks).
+- 80 load units, one per cell: the ten cell bits are put on lines 0D.5, 0D.7, 10.1, 15.5, 11.6,
+  11.5, 06.6, 07.6, 0D.0 (bits 0–8) and 0C.3 (bit 9), then port 0C bit 4 is pulsed. The module
+  changes one line per write from a shadow of each port.
+- Order: an 80-cell line is shifted last cell first (unit u carries cell 79 − u). A 16-cell line
+  still takes 80 units: cell c rides in unit 5·(15 − c) + 4 and the rest are all ones.
+- The programming pulse starts with `14=0D`, port 0D bit 4 raised, `14=09`, and the call returns.
+  It is ended by the next call's first writes: `14=0D`, 0D bit 4 dropped, `14=0C`, `0C=18 0C=08`.
+  So the pulse length is whatever time passes between the two calls.
+`max7000.LineWriter` reproduces four consecutive writes (rows 5, 90, 0, 128) op for op.
+Open before any native programming on hardware: the rail correction that turns 12750 mV into
+DAC 164 (the plain formula gives 162; 9000 mV VPG gives 118 against 114), how the pulse time is
+kept, verify, and the erase sequence.
+
+## Programming-rail code rule (2026-11-26)
+From 0x10018ae5 / 0x10018b21, confirmed by a simulated sweep of eleven VPD and three VPG values:
+above 5000 mV the request is raised before conversion — VPD by (mV − 5000)/50, VPG by
+(mV − 5000)/12 — then code = mV·255/20000. `board.vpd_code` / `vpg_code`; the earlier "+1" for
+12 V in the native read set-up is replaced by this rule (same result, 154).
+
+## Erase and pulse timing decoded in simulation (2026-11-26) — not run on a chip natively
+- Erase start (after a set-up): 1 ms delay, `0D=10`, `0D=12`, `0C=00` (`0C=80` for the
+  manufacturer's erase that also clears the signature row), `01=C0 01=00`, `14=08`. The erase time
+  argument never reaches the wire. Erase end, sent at the start of the module's next call:
+  `14=0C`, short delay, `07=04` (only with flag 0x10000 in the pulse argument), `0D=10`, `0C=00`,
+  `0D=00`, `07=00`. `max7000.erase_start_ops` matches the module's traffic exactly.
+- Delay routine 0x10006d40(x), x = calibration × milliseconds: up to 1 ms it emits `01=C0`,
+  ceil(1000·x/cal)·0.75 − 1 no-ops, `01=00` (so 750 commands per ms; the earlier "16.5 µs per
+  command" reading of the calibration was wrong — it is host loop iterations per ms). Above 1 ms
+  it spins a host loop, which is how programming and erase pulse times are kept; nothing shows
+  on the wire. In the emulator that loop runs at emulator speed, calibrated against real time.
+- Row write end (0x1000cff5): strobe on, host wait of calibration × Tprogram, strobe off. In the
+  captures the "off" writes only leave with the next call, so on real hardware the pulse lasted
+  from one call's flush to the next. Native code sends on, sleeps, sends off.
+- pgm.dll's row programmer (0x10013c08) calls set_column_address and
+  program_bytes_on_column(…, 0, 0) per row with no wait of its own.
+`programmer.erase_epm7160e` / `program_epm7160e` assemble these; unit-tested for structure only.
+I could not hook the delay routine in the emulator to confirm wait positions directly.
+
+## Device model files: first look (2026-11-26)
+`vendor/.../7k/` holds, besides the programmer's `.pcf` files, the compiler's device data:
+27 `.maf` (architecture), 82 `.daf`, 94 `.ddf` and 137 `.dmf` (per speed grade) files. No sample
+`.pof` files ship with the package; the tutorial has AHDL (`.tdf`) and schematic (`.gdf`) designs.
+`.maf`: "MAF\0" header whose u32 at 0x0C is the number of logic array blocks (2 for the EPM7032 up
+to 16 for the EPM7256), then named block-type records (ROW, COLUMN, MCELL, GH, PIA, HIO; later
+families add PIA_INPUT, POE) and large undecoded tables. HIO's count is macrocells + 4.
+`apu/maf.py` reads this much. My first reading of the record fields as per-device counts was
+wrong (they are identical in every file) and was dropped.
+These files are the input a native fitter and assembler would need; decoding them means
+reversing the compiler DLLs that read them, which has not started.
+
+## Which MAX+PLUS II modules hold the remaining knowledge (2026-11-26)
+By the file extensions each module names (BASELINE directory, 105 executables and DLLs):
+| module | references | role (inferred from name and references) |
+|---|---|---|
+| `asm.dll` | `.daf`, `.pcf` | assembler: fitted design → fuse data. The fuse-level model (stage 3) lives here and in the `.daf` files |
+| `p2j.dll`, `f2p.dll` | `.pof` | programming-file conversion (POF ↔ JEDEC). The quickest route to the POF format (stage 2) |
+| `vpr.dll` | `.maf`, `.acf` | reads the architecture files; partitioner/router |
+| `fit.dll` | `.acf` | fitter (1.8 MB) |
+| `mls.dll`, `cmp.dll`, `mdl.dll` | `.acf`, `.cnf`, `.tdf` | logic synthesis, compiler driver, design database |
+| `sim.dll` | — | simulator |
+Roles are inferences, not traced. Nothing here has been reversed yet.
+
+## POF format lead (2026-11-26)
+`p2j.dll` (32 KB, export `p2j_convert_pof_to_jedec`) carries debug strings that outline the POF:
+a sequence of packets (length, tag) with tags Creator_Id, Device_Name, Comment_Text, Turbo_Bit,
+Security_Bit and Address_and_Data. One Address_and_Data form has start_col, start_row,
+col_count, row_count, mask, flags — the same row/column/mask addressing the programmer uses —
+and another has start_address and representation_width. The module opens the device's `.daf`
+and `.ddf` through `GE.dll`. Next step for stage 2: reverse this module for the packet layout and
+the row/column → JEDEC mapping, then write a native POF reader/writer and check it against the
+`.pcf` fuse map already decoded.
+
+## POF container decoded (2026-11-26)
+From `p2j.dll` and `GE.dll` (static reading; nothing hosted):
+- Header: 6-byte magic `POF\0\0\0`, u16 version = 1 (GE.dll keeps a table of file types at
+  0x100367f8: 6-byte extension, then current/max/min version; `pof` is entry 14 with 1/1/1),
+  u32 packet count.
+- Packet: u16 tag, u32 length, payload. The converter dispatches on tag − 1 through an 18-entry
+  table: 1 Creator_Id, 2 Device_Name, 3 Comment_Text, 4 Turbo_Bit, 5 Security_Bit, 6 logical
+  address and data (four u16: start_address, representation_width, address_count, flags),
+  7 electrical address and data (six u16: start_col, start_row, col_count, row_count, mask,
+  flags), 8 terminator (u16 CRC), 9 Symbol_Table, 10 Test_Vectors, 17 logical with a u32 start
+  address and u32 count, 18 one more u16 (name not recovered).
+- CRC: `ge_crc_init` 0xFFFF; `ge_crc_update` reflected, polynomial 0x8408; `ge_crc_get_value`
+  inverts — CRC-16/X.25. Every read in the converter goes through one wrapper that updates it,
+  so it covers the file from offset 0 through the terminator packet's tag and length.
+`apu/pof.py` reads and writes this (round-trip and CRC check-value tests). Untested against a
+real POF: none is available. Still to do: how electrical data bytes map to cells, then
+POF ↔ read-back image ↔ JEDEC conversion.
+
+## POF electrical data ↔ device regions (2026-11-26)
+`p2j.dll` 0x100028f1 pairs each electrical packet with one 20-byte region record from the device
+file by comparing all six header fields: start_col = region row (line), start_row = region
+column (cell), col_count = lines, row_count = cells per line, mask, flags = region kind. Altera's
+"column" is the line address — the same naming as the module's `set_column_address(row)`.
+0x10002760 then copies the payload byte for byte, line by line, a fixed number of bytes per
+cell (a device-wide bit width / 8). So a POF's data blocks are the `.pcf` regions verbatim.
+`apu/pof.py: image_to_pof / pof_to_image`; `python -m apu topof image.json out.pof`, `python -m
+apu pof file.pof`. B9513's native read-back makes a 17 kB POF with seven electrical packets and
+converts back with every cell equal except two on lines 129–133 where the device's mask (0x2FF)
+excludes bit 8. Assumptions still open: two bytes per cell, low byte first; which region kinds a
+real POF carries (data kinds 0x200 and 0x20 are written; the ID row is left out).
+
+## JEDEC polarity settled; native POF ↔ JEDEC (2026-11-26)
+`p2j.dll` 0x10002bbb–0x10002c5c: for 16-bit cells it reads low byte then high byte, ANDs with the
+fuse's mask and sets the JEDEC bit when the result is non-zero. So cells are little-endian
+16-bit and **fuse = 1 iff (cell & mask) ≠ 0, no inversion** — what `dump_to_jed.py` assumed. This
+answers the long-open polarity question to the extent that POF cell values are what the
+programmer writes and reads back (pgm.dll passes POF data to the row write unchanged, 0 bits
+programmed). Its JEDEC header (0x100022f6): STX, comment, `QF n *`, optional `QP`/`QV`, `ND
+<device> *`, `NV MAX+plus II Version … *`, `G1*`/`G0*` from the security bit, then `L0` and the
+fuse data.
+`apu/jedec.py` (write, parse, fuses ↔ image) and `python -m apu pof2jed / jed2pof`. On B9513's
+image: POF → JEDEC gives the same 74653 fuses as the earlier image → JEDEC tool, and
+JEDEC → POF → JEDEC is stable. A POF rebuilt from JEDEC differs from the original in 948 of 8416
+cells, all in bits no fuse covers (the fuse map uses 74653 of the 84160 cell bits); those bits
+come back as 1.
+
+## EPM7064 (module type 0x0D) native read path — simulation only (2026-11-26)
+Each device group has its own line protocol. For the EPM7064:
+- Row address in parallel, not clocked: bits 0–2 → port 15 bits 3, 2, 1; bits 3, 4 → port 11 bits
+  6, 5; bits 5, 6 → port 11 bits 2, 1 for rows below 128. Rows 128+ set port 11 bit 0, keep bits
+  3, 4 on 11.6/11.5 and carry bits 5, 6 on port 15 bits 7, 5 in a second write of port 15. The
+  module leaves those two lines as they were for later lower rows (shadowed state).
+- Sixteen precharge units on ports 07/0B/10, then `0D=02` (or `06=50` for the signature row,
+  row 124), then 80 or 16 clocks on port 3 bit 7 with four reads each (03, 10, 07, 0C); every 16
+  clocks an interlude on ports 0C/0B with 4-no-op delays.
+- Four-bit cells: bit 0 = 03.5, 1 = 10.3, 2 = 07.4, 3 = 0C.0 (found by feeding single port bits to
+  the module in simulation). Cell order as for the EPM7160E.
+- Set-up: identical to the EPM7160E's except the opcode-5 table (03=DF 04=FF 05=FF 06=FB 07=EF
+  0B=FF 0C=F6 0D=DF 0E=FF 0F=FF 10=F7 11=FF 12=FD 13=FF 14=EF 15=FF) and the tail (`10=00 0B=00
+  0B=00 07=00`, 120 pulses of port 0B bit 4). Release before shutdown: `0C=00 0D=00 06=00`.
+`max7000.line_read_ops_7064` matches all 20 captured module reads; `programmer.read_setup_ops`
+matches the module's set-up for both devices (the EPM7160E against the real-unit capture).
+`programmer.PROFILES` now carries the per-device differences; `python -m apu id|read --part
+EPM7064 --allow-unverified` exists but has not been run on a chip. After the refactor the
+EPM7160E was re-read on the unit: same ID, and all cells equal to the earlier native read.
+The EPM7032 (type 0x0A) differs again (one read port, serial addressing) and is not done.
+
+## EPM7032 (module type 0x0A, PLMJ7000-44) native read path — simulation only (2026-11-26)
+- 44-pin adapter layout: only ports 03–07 and 0B–0D are used. Supply-on clears them and writes
+  opcode-5 03=83, 06=80, others 0. Read set-up: `03=02`, others 0, the same opcode-5 release,
+  `0A=01`, delay, `0A=81`, delay, drive table (05=FF 06=71 07=A5 0B=FF 0C=0F), `06=00 0C=00`,
+  120 pulses of port 06 bit 4.
+- Row address in parallel: bits 0, 1 → port 0C bits 1, 0; bits 2–6 → port 0B bits 7 down to 3.
+- Line read: on a repeat, `05=00`, port 0C rewritten with the previous row's bits, `06=00`; then
+  address; 16 latch units on ports 06/0C preceded by 4 pulses each (80-cell rows) or by 0, 8, 0,
+  8 … pulses (16-cell rows); `0C` bit 2 raised (or `06=01` for the signature row, row 124); a
+  ten-write clock on ports 02/03/09 (toggling port 3's opcode-5 register); `05=20`; one read of
+  port 07 per cell; an interlude every 16 cells.
+- Two-bit cells: bit 0 = 07.3, bit 1 = 07.4. Cell order as the other devices.
+`max7000.line_read_ops_7032` matches all 16 captured module reads and `read_setup_ops` matches
+the module's set-up. `python -m apu id|read --part EPM7032 --allow-unverified` exists; not run on
+a chip. The signature decode for this group is from the module's code only.
+
+## Chip parameter codes, stream rate, native program command (2026-11-26)
+- pgm.dll's parameter routine for the EPM7160E group (0x1003cc7d → 0x1003cdc9): signature bytes
+  8 and 9 give three indices: Vpp = 11250 + 250·(byte9 >> 5 & 7) mV; a programming-time index
+  byte8 & 0x1F into a 32-entry table (20, 40, 60 … 600 at index 23 … 2000); an erase-time index
+  byte8 >> 5 & 7 into (10, 20, 30, 40, 60, 100, 200, 500). A flag in the device record selects a
+  second pair of tables and a different bit split. For B9513 (D7 80): Vpp 12250 — matching the
+  hosted run — time index 23 → 600, erase index 6 → 200. The hosted run that programmed B9513
+  logged Tprogram 60, read when its signature row was only partly restored, so the two do not
+  contradict, but **the unit of these time values is unresolved** (the routine's debug print
+  divides by ten). Native code takes Vpp from the chip only as a suggestion and never takes times.
+- Stream rate, measured natively: 60000 no-ops take 181 ms, about 3 µs each (USB-limited). The
+  module's delay routine assumes 750 commands per millisecond, so its "1 ms" delay of 749 no-ops
+  really lasts about 2.3 ms on this set-up.
+- `python -m apu program FILE --vpp-mv N --tprog-ms N` (POF, JEDEC or image): prints the plan
+  and stops unless `--yes-really-program`; then programs line by line and verifies by native
+  read-back inside the device's masks. Dry runs on B9513's image: from the POF 167 of 170 lines
+  and 21770 bits; from the JEDEC 123 lines and 20381 bits (bits no fuse covers are left alone).
+  Not run on a chip.
+
+## Device assembler files (.daf): first structure notes (2026-11-26)
+The `.daf` files are the assembler's fuse-level description (they are what `asm.dll` and `p2j.dll`
+open through `GE.dll: ge_open_daf`). From the loader (GE.dll 0x10017f76) and m7032044.daf:
+- 8-byte header `DAF\0\0\0` + version (0x0E), then a 0x8C-byte fixed block read in one piece. Its
+  first u32 is the device's fuse count (0x3950 = 14672 for the EPM7032, the same number the
+  `.pcf` declares).
+- Then a sequence of element descriptors held in memory as 0x30-byte records: nine u32 fields
+  read one by one, followed by optional arrays whose presence is tested through the record's
+  fields at +0x24, +0x28 and +0x2C (one array is of 16-byte entries). The loader runs this
+  pattern twice, then reads arrays of 16-byte and 32-byte entries and further counted blocks.
+- The body is dense with fuse numbers (for example runs of 0x3700, 0x370C, 0x3718 … stepping by
+  12), so the files do map logical resources to fuse addresses.
+Nothing here is decoded to meaning yet. That needs the element semantics from `asm.dll`
+(164 KB), which is the next large piece of reversing for stage 3.
+
+## Device assembler files parsed (2026-11-26)
+`apu/daf.py` follows GE.dll's loader exactly: 0x8C-byte header; h[0x28]+1 then h[0x2C]+1 element
+records (nine u32 fields; f8+1 u32; f5+1 four-u32 entries; an (f6+1) × (f7+1) u32 matrix); then
+21 tables sized by header fields. **All 160 `.daf` files in the package parse with zero bytes
+left over**, so the container is right.
+What the EPM7032's file shows (m7032044.daf, 14672 fuses):
+- header: h[0x30] = 44 pins, h[0x34] = 32 macrocells, h[0x38] = 2 LABs, h[0x10] = 88;
+- table t34e: one entry per macrocell, 0, 440, 880 … — 440 fuses per macrocell, i.e. five
+  product terms of 88 inputs (36 routed signals in true and complement plus 16 shared-expander
+  inputs would make 88); 32 × 440 = 14080;
+- element records carry per-macrocell fuse numbers in their matrices: ids 24, 25, 26, 27, 28, 1,
+  29, 30, 31 (two fuses), 6, 32 occupy twelve consecutive fuses per macrocell from 14080, and id
+  34 two per macrocell from 14608;
+- 14464–14607 (144 fuses) are not in these matrices.
+On the larger devices h[0x10] is 11 and t34e steps by 55, so that pair means something else
+there; and the EPM7160E has further element ids (81, 82, 83, 84, 67).
+Not known: what each element id controls, the order of inputs within a product term, and the
+entries of the other tables. That is asm.dll's side.
+
+## EPM7032 fuse map: structure confirmed on a real chip (2026-11-26)
+- A macrocell's array starts at (block − 1) · h[0x14] + t34e[macrocell], with the block number in
+  table t34c and h[0x14] = 7040 the size of one logic array block (16 macrocells × 440). My first
+  version used t34e alone and so read block 1 twice; a test caught it.
+- `apu/fusemap.py` + `python -m apu fuses x.jed`: per macrocell, five product terms as lists of
+  connected columns (fuse 0 = connected) and the option elements' values.
+- The EPM7032LC44-12's own contents fit the model: of 160 product terms 74 have no connections,
+  26 have every column connected, and 60 carry one to nine literals. Columns 72–87 (taken to be
+  the shared expanders, from table t54a) are each used about once; among columns 0–71 a few
+  recur across many terms (7, 39, 71, 67, 19 …), as an address decoder's inputs would.
+- The 144 fuses 14464–14607 are outside the array and the per-macrocell elements; 36 routed
+  signals × 2 blocks × 2 bits would make 144, so they are probably the signal routing selects.
+Still unknown: the signal on each column, true/complement order within a pair, the meaning of
+each option element, and the 144 routing fuses.
+
+## Assembler-file field names, and the layout generalised (2026-11-26)
+`asm.dll` contains a routine that writes an ASCII dump of the loaded `.daf` ("ascidaf.dmp"); its
+format strings name every field. `apu/daf.py` now uses those names:
+- header: total_bits, wl_offset, pt_offset, mc_pt_offset, pia_wl_offset, lab_offset, pia_offset,
+  lab_pia_wls, pia_wls, pt_wls, arch1_bits, arch2_bits, n_pins, n_mcs, n_labs, (bit_tab size at
+  0x3C), n_default_groups, n_jedec_groups, n_vpterms, n_jedec_bits, pterms_per_mc, exp_per_lab,
+  exp_per_mc, lab_clocks, lab_clears, initial_arr_val, first_pia_addr, por_wl_1, por_wl_2,
+  assemble_mux, assemble_por, jedec_defined, bit_matches_jed, bit_shift, bit_mask. The dump's
+  order matches the file except for the count at 0x3C, which I take to be its last name,
+  n_data_bits (assumption; the names after 0x3C are the dump's order shifted by one).
+- element ("arch_hdr1/2"): arch_type, arch_value, num_bits, offset, index, num_vpterm, addr_rows,
+  addr_columns, num_select; then select[], arch_vpterm[] (input_eq_type, vpterm, condition,
+  setting) and arch_addr[row][column] (fuse addresses; row = macrocell, pin or block).
+- tables: default_group, bit_jed_conv, oe_pin, io_wl, mc_wl, exp_wl, pia_wl, io_pia_wl, mc_pia_wl,
+  mc_lab, mc_data_bit, pia_data_bit, pia_addr, pia_wl_polarity, vpterm_array (input_eq_type,
+  pterm_offset), mc_pterm, exp_pterm, exp_data_bit, pin_mc, output_mc, bit_tab. "wl" = word
+  line, an input column of the array.
+With the names the array layout is the same on every device: pt_wls = 88 columns, pterms_per_mc
+= 5, a macrocell's terms start at (block − 1)·lab_offset + mc_pterm·mc_pt_offset and are
+pia_wl_offset·mc_pt_offset = 88 apart (the EPM7032 stores 88 and 1, larger devices 11 and 8).
+`fusemap.FuseMap` now handles all of them, and gives each macrocell's pin from pin_mc.
+Real images through it: EPM7064 — 320 terms: 164 empty, 65 fully connected, 91 with 1–15
+literals; EPM7160E (B9550) — 800 terms: 271 empty, 133 fully connected, 396 with literals.
+Virtual product terms (EPM7032): eleven (input_eq_type, physical term) pairs — (0,0) (1,1) (0,2)
+(0,3) (0,4) (1,0) (0,1) (3,2) (2,3) (5,3) (4,4). So each physical term either feeds equation
+type 0 (taken to be the macrocell's OR) or a special input: types 1, 3, 2/5 and 4 on terms 0/1,
+2, 3 and 4. The option elements 24, 25, 26, 27, 28 and 1 list which virtual terms they depend
+on; these are the product-term steering fuses. What equation types 1–5 are (clock, clear,
+preset, enable, XOR …) and what elements 29, 30, 31, 6, 32, 34 do is not yet known; the
+database module that defines those enumerations has not been looked at.
+
+## Where the option elements get their meaning (2026-11-26)
+`asm.dll` 0x10006880 is the assembler's per-element routine: it takes (element index, design
+node), reads the element's arch_type, and dispatches through a byte-indexed jump table over
+types 1…0xB9 (index bytes at 0x1000e309, targets at 0x1000e195). Each case derives the fuse
+value from flag bits in the design node record (for example node+0x28 bits 0x10, 0x40, 0x80,
+0x100, 0x200) and calls 0x100123b6(value, element, row) to set the element's fuses. The routine
+is about 30 kB. asm.dll imports nothing descriptive from the database module (only generic
+record iteration), so the flag bits have no names here; naming them needs either the database
+module's record definitions or designs with known settings.
+Decoding this switch for the dozen MAX 7000 element types (24–32, 1, 6, 34, and the E-family's
+81–84, 67) is the remaining work for a fuse-level disassembler. Not started.
+
+## Lead: the design database also has a named dump (2026-11-26)
+`db.dll` carries format strings for a text dump of its records, with field names: for placed
+nodes `resource`, `pin`, `mc`, `lab`, `row`, `column`, `rdf_bits`, `use_count`, `userpin` …; for
+equations `eq_type`, `src1`, `src2`, `output`, `pterms`; and device-level `turbo_bit`,
+`security_bit`, `invert_input`, `slow slew`, `expander`. Matching that dump routine's field
+accesses to the offsets asm.dll reads (node+0x14, +0x18, +0x28 …) should name the flag bits the
+option elements are computed from, and `eq_type` is the likely source of the assembler file's
+`input_eq_type` values. Not yet done.
+
+## Design-database placed-node record: named offsets (2026-11-26)
+From `db.dll`'s record dump (the routine referencing "mc %3d " at 0x10003380), each format string
+paired with the field it loads:
+| offset | name | offset | name |
+|---|---|---|---|
+| +0x0C | clique | +0x48 | lab (userlab) |
+| +0x10 | resource | +0x4C | row (userrow) |
+| +0x14 | pin | +0x50 | column (usercolumn) |
+| +0x18 | mc | +0x54 | pin_next |
+| +0x28 | rdf_bits | +0xE8 / +0xEC | Assign / Assign_index |
+| +0x38 | temp_id | +0xF8 | bit field: periph out/fbk/inp, oe_source, use_oe, unused_input, invert_input, routing cell, mpp_created_pin |
+| +0x3C | index | +0xFC | bit field: auto_pin_name_suffix, increase_delay, pci_io, pullup_resistor, bus_hold, input_reference, io_standard, low_cap, power_up_high, legally_placed, packed_local, dup_reg_id, rdf_exp, open_drain, gtl_open_drain |
+| +0x40 | part | +0x104 / +0x108 | lut_mask / backup_lut_mask |
+| +0x44 | userpin | +0x13C / +0x140 | borrower / lender (parallel expanders) |
+| +0x16C / +0x170 | use_count / max_2_fanout | | plus arrays input_eqs[], pterm_types[], lut_inputs[] |
+So in asm.dll's element routine, node+0x14 is the pin, node+0x18 the macrocell, and node+0x28 is
+`rdf_bits` — the flags the steering and option fuses are computed from (bits 0x10, 0x40, 0x80,
+0x100, 0x200 seen so far). The individual rdf bits are not named by the dump (it prints the
+word in hex); db.dll does hold the primitive names (DFF, DFFE, TFFE, JKFFE, SRFFE, LATCH, MCELL,
+EXP, SOFT, TRI, INPUT, OUTPUT, BIDIR, CARRY, CASCADE), which is where to look next for what
+sets each bit.
+
+## Product-term steering decoded from the device file itself (2026-11-26)
+- asm.dll's helper 0x100061e0(node, k) returns the node's `pterm_types[k]` (array at node+0xA8;
+  the database dump names it) — the role assigned to physical product term k.
+- The case for element 27 sets its fuse to 1 unless pterm_types[3] is 2 or 5, when it sets 0.
+  The device file says the same thing in element 27's arch_vpterm entries: (0, vp4, 1),
+  (2, vp9, 0), (5, vp10, 0) — (equation type, virtual term, fuse value). So for one-fuse
+  elements the third field is the fuse value used when the term serves that equation type,
+  and **the steering can be read from the `.daf` without the code**. Element 1 picks between
+  types 5 (fuse 1) and 2 (fuse 0) on term 3.
+- The cases for elements 24, 25, 26, 27, 28 call the helper with k = 0, 1, 2, 3, 4: they are the
+  five terms' steering elements. Type 0 is the macrocell's own sum; types 1 (terms 0 and 1),
+  3 (term 2), 2 and 5 (term 3) and 4 (term 4) are the special inputs, not yet named.
+- Other cases, by what they test: element 29 — rdf_bits 0x800000; element 30 — no borrower
+  (parallel expander) and a helper; element 31 (two fuses) — rdf_bits 0x20, 0x300, 0x400;
+  element 6 — rdf_bits 0x40 / 0x300; element 32 — bit 0 of the node's +0xF8 field (the dump's
+  "periph out"); elements 34 and 83 — pin nodes (rdf_bits 0x80), the output-enable select;
+  81 — rdf_bits 0x100; 82 — rdf_bits 0x80000000. rdf_bits 0x10 marks a macrocell node.
+`fusemap.FuseMap.term_roles()` applies the one-fuse tables; the listing now tags each term. On
+the real EPM7032: term 3 is the sum in 12 macrocells (always empty there) and type 2 in 20
+(one or two literals in 18 of them) — what a clock or clear term would look like.
+
+## Steering for all five terms (2026-11-26)
+Elements 24, 25, 26 and 28 are one-fuse select elements: asm.dll's cases call the select setter
+with an index, and the fuse value is the element's select[index]. Their arch_vpterm entries give
+(…, virtual term, select index), so the mapping again comes straight from the `.daf`:
+| element (term) | fuse 0 | fuse 1 |
+|---|---|---|
+| 24 (term 0) | type 1 | sum, or type 1 |
+| 25 (term 1) | sum | sum, or type 1 |
+| 26 (term 2) | type 3 | sum, or type 3 |
+| 27 (term 3) | type 2 or 5 (element 1: 0 → 2, 1 → 5) | sum |
+| 28 (term 4) | type 4 | sum, or type 4 |
+A 1 is ambiguous for 24, 25, 26, 28 from these tables alone; the assembler's cases choose among
+several select indices with the same fuse value using other state (register flags, borrowed
+terms). In asm.dll the per-term role (`pterm_types[k]`) is a separate enumeration: 2 and 5 mean
+a special input, 3 the sum, and 0/1 unused, judging by the cases for elements 26 and 27.
+On the real EPM7032 (32 macrocells): term 4 is steered to type 4 in every macrocell (fully
+connected in 14, empty in 12, literals in 6); term 2 is type 3 with no connections in 12 and
+otherwise sum-or-type-3; term 3 as before. `FuseMap.term_roles()` implements the table.
+Note the first field of an arch_vpterm entry does not always equal the virtual term's own
+equation type (element 25's entries), so that field's meaning is still open.
+
+## Architecture files parsed; signal routing located (2026-11-26)
+`apu/maf.py` now follows GE.dll's loader (ge_open_maf): six header u32, ROW/COLUMN records,
+block-type records (MCELL, GH, PIA, HIO, …), a u32 table, then routing entries of five i32
+(type, index, f2, n_targets, n_fuses) + targets + (fuse address, flags) pairs. **All 27 MAX 7000
+`.maf` files parse with nothing left over.**
+EPM7032: 208 entries = 32 macrocells, 68 GH lines, 72 PIA inputs (36 per block), 36 HIO. A
+macrocell or HIO entry targets the GH line it drives; a GH line targets the PIA inputs it can
+reach and gives, for each, the address of that input's select field and the value that selects
+it. Flags: bits 0–9 position in the line's list, bits 10–15 field width in fuses (2, 3, 4 on the
+EPM7032, EPM7064, EPM7160E), bits 20–27 select value, bits 30–31 extra flags on some entries.
+The select fields are exactly the fuses the assembler file leaves unexplained: 14464–14607 on
+the EPM7032 (72 fields × 2), 28928–29359 on the EPM7064 (144 × 3). Each field chooses among 3–4
+sources (EPM7032), 7–8 (EPM7064) or 14–15 (EPM7160E).
+Real images: every field of the EPM7032 and EPM7064 chips holds either a value that has a source
+or, on the larger device, all ones (no source listed for that value: an unused input). On the
+EPM7160E the count of unmatched fields depends slightly on the assumed bit order (311–320 of
+366, the minimum when the third fuse is the low bit), so the order of fuses within a field is
+**not established** — on the two smaller chips every order decodes equally well.
+`maf.routing()` returns {field address: (width, {value: ("mc"|"hio", n)})}.
+Still needed to name a product term's inputs: the field bit order, which array column pair each
+PIA input feeds (taken to be 2m and 2m+1 so far, unverified), which column of a pair is the
+complement, and which pin each HIO entry is.
+
+## Routing select encoding: the simple reading fails on larger devices (2026-11-26)
+Looking at the bit patterns actually present in the select fields of real chips:
+| chip | field width | sources per field in the file | patterns present |
+|---|---|---|---|
+| EPM7032 | 2 | 3–4 | 00 ×34, 11 ×18, 01 ×16, 10 ×4 |
+| EPM7064 | 3 | 7–8 | 111 ×73, 011 ×38, 101 ×27, 110 ×6 |
+| EPM7160E | 4 | 14–15 | 1111 ×311, 1110 ×19, 1011 ×18, 1101 ×10, 0111 ×8 |
+On the two larger chips a used field always has exactly one programmed fuse, so three or four
+choices, not the eight or fifteen the file's select values would give if the field held the
+value in binary. So "field = value" is wrong there (it still decodes without contradiction only
+because the single-zero patterns happen to be valid values). The select value must combine with
+something else; on the E family there is a further entry type (4, "PIA_INPUT", 360 entries) with
+its own fuse per input. asm.dll does not read the `.maf` at all and its `.daf` PIA tables are
+empty for these parts, so the routing fuses are placed by other code — the fitter/router side
+(`fit.dll`, `vpr.dll`) — which has not been looked at.
+I withdrew the "value selects the source" wording from `maf.routing()`; what stands is the file
+structure, the field addresses and widths, and the source lists per field.
+
+## Routing select values: more evidence, still unresolved (2026-11-26)
+- In the architecture files the select values are ordered by source kind: on the EPM7064 values
+  0–2 are macrocell feedbacks, 3 mixed, 4–7 I/O entries (7 present in only 48 of 144 fields); on
+  the EPM7160E 0–7 are macrocell feedbacks, 8 mostly, 9–14 I/O entries.
+- Reading a field as a binary number (first fuse = low bit), the real EPM7064 uses only values 7
+  (all ones, 73 fields), 6 (38), 5 (27) and 3 (6): never a macrocell-feedback value and never 4.
+  Decoded sources: 67 I/O entries and 4 macrocells that carry no logic. The EPM7160E uses 7, 11,
+  13, 14 only.
+- So two readings remain, and I cannot choose between them from data: (a) binary, with these two
+  designs happening to take block inputs almost only from pins and from a narrow set of
+  values — unlikely given that no two-zero code ever occurs in 126 used fields; (b) the fuses
+  are not a binary select at all. Neither is established.
+The router's code is the way to settle it (GE.dll exports `ge_get_routing_struct_for_maf_index`,
+`ge_get_maf_direct_source`, `ge_set_maf_routing_destinations` for it).
+
+## Native AHDL front end started (2026-11-26)
+Independent of the reversing work: `apu/ahdl.py` is a lexer and recursive-descent parser for
+AHDL written from the language as the tutorial designs use it (comments, TITLE / INCLUDE /
+CONSTANT / FUNCTION prototypes, SUBDESIGN ports with groups, VARIABLE sections including state
+machines and instances, Boolean equations, IF / CASE / TABLE / DEFAULTS, calls with empty
+arguments, `inst.(a, b)` port groups, names that start with or consist of digits). All 38
+`.tdf` files in the tutorial parse. `apu/ahdl_eval.py` evaluates purely combinational designs
+(equations ORed per node, DEFAULTS, IF, CASE, TABLE with don't-cares, groups, constants,
+== and !=) by iterating to a fixed point, and refuses anything with registers, machines,
+instances, BIDIR ports or arithmetic. 13 of the tutorial designs construct under it.
+`python -m apu ahdl x.tdf` prints the structure and, for small combinational designs, a truth
+table. Nothing here produces fuses: logic synthesis, fitting and assembly are not started.
+
+## AHDL: registers and state machines simulated (2026-11-26)
+`apu/ahdl_eval.py` now handles DFF / DFFE / TFF / TFFE (clock, enable, asynchronous clear and
+preset), state machines (clock, reset, enable; next state holds when not assigned; optional
+state values and bit names), one-bit-to-group broadcast, + and − on groups and ordered
+comparisons. `Simulator.set()` applies input changes and clocks every register whose clock rose,
+using the input value from before the edge; `clock()` pulses a clock. Functional only — no
+delays, no setup/hold. Checked with my own designs (a loadable counter with enable and clear,
+a toggle, a three-state machine); not compared with the vendor simulator.
+
+## Two-level synthesis for small flat designs (2026-11-26)
+`apu/synth.py`: every output and register input is tabulated with the evaluator over all values
+of the design's inputs and register outputs (at most 14 signals), signals a function does not
+depend on are dropped, and the table is minimised (Quine–McCluskey primes, greedy cover). The
+polarity with fewer terms is kept and flagged as inverted, since a MAX 7000 macrocell can invert
+its sum. Registers get D (enable and T-type folded in), clock, clear and preset equations; a
+state machine's reset becomes clear or preset per bit according to the reset state's code.
+Tests replay the equations against the simulator (all input combinations for combinational
+designs; 300 random clocked steps for a counter). `python -m apu synth x.tdf` prints the
+equations. This is device-independent: no product-term limit, expander use, pin assignment or
+fuses — the fitter and assembler stages, which also still need the routing encoding and the
+option-fuse meanings from the reversing side.
+
+## A wrong synthesis result caught, and its two causes (2026-11-26)
+The tutorial's `speed_ch` first synthesised to equations that ignored its input. Causes, both
+mine: AHDL names are case-insensitive (`Accel_in` declared, `accel_in` used) and my evaluator
+treated the two as different; and it silently read any unknown signal as 0. Fixed: the lexer
+lower-cases names, and an unknown signal is now an error. Regression test added. `speed_ch` now
+gives next-state equations that depend on `accel_in`, as its source says. 19 of the 38 tutorial
+designs synthesise; the rest need hierarchy or library macrofunctions (8), exceed the
+exhaustive method's 14-signal limit (6), or use BIDIR / machine ports / one unhandled
+construct (5).
+
+## Synthesis limit now per function (2026-11-26)
+`Design.dependencies()` derives, from the statements' structure, which inputs and register
+outputs each driven signal can depend on (bit-by-bit for bitwise group expressions; every
+enclosing IF / CASE / TABLE condition included; resolved through intermediate nodes).
+`synth.synthesise` tabulates each function over its own support only, with all other signals
+held at 0, so the 14-signal limit applies to one function instead of the whole design. A
+24-input design whose outputs each depend on three inputs now synthesises. 21 of the 38 tutorial
+designs synthesise; four still have single functions wider than the limit (16–19 signals), which
+needs a symbolic method instead of tabulation.
+
+## AHDL: inline primitives (2026-11-26)
+The evaluator now rewrites inline `DFF(d, clk, clrn, prn)`, `DFFE`, `TFF`, `TFFE` calls into
+anonymous registers, drops the transparent buffer primitives (LCELL, MCELL, SOFT, GLOBAL, WIRE),
+turns `EXP(a)` into `!a`, and evaluates groups that mix constants and signals such as
+`(0, !at_zero)`. The tutorial's switch debouncer (an 8-bit down-counter preset to 255) now
+simulates and emits its single pulse on the 254th clock after the key is pressed, which is what
+its source describes. Tutorial coverage: 27 of 38 simulate, 23 synthesise. The remaining eleven
+all need hierarchy (instances of other designs or of library macrofunctions such as `4count`,
+`8count`, `74151`), tri-state/BIDIR, or machine ports.
+
+## AHDL: hierarchy flattened (2026-11-26)
+`ahdl_eval.flatten()` expands instances of other AHDL designs — both `u : other;` variables with
+`u.port` references and inline calls `other(a, b)` (argument order from the FUNCTION prototype,
+else the callee's port order) — into one flat design, prefixing the instance's names and turning
+its ports into nodes; unconnected inputs take their declared default. Designs are found through
+a resolver (`directory_resolver` looks for `<name>.tdf` beside the file). Checked on my own
+two-level example (two half adders and a registered bit). Tutorial coverage is unchanged at 27
+simulating / 23 synthesising: what remains needs the vendor's library macrofunctions (`4count`,
+`8count`, `74151`, which ship as compiled library files, not AHDL), tri-state and BIDIR pins,
+or state machines passed through ports.
+Also noted: a signal named `x` clashes with AHDL's don't-care `X`; my parser treats a bare `x`
+as the don't-care, which is wrong for a design that really names a signal `x`.
+
+## AHDL: tri-state, BIDIR pins, and the `x` clash (2026-11-26)
+- `pin = TRI(in, oe)` (as a whole right-hand side) and BIDIR ports are modelled: the pin shows
+  the buffer's input when the enable is high, otherwise whatever the outside drives; a BIDIR pin
+  nothing drives is an input. `Simulator.set(pin=…)` sets the outside value. Synthesis gives such
+  a pin two equations, data and `.oe`, and feedback from the pin appears as `pin@ext`.
+- A bare `X` is now a don't-care only where no signal is called `x`; a design may name a signal
+  `x` again. (The parser used to hard-wire the don't-care reading.)
+Tutorial coverage: 28 of 38 simulate, 24 synthesise. Left: library macrofunctions (5 designs),
+machine ports (4), a BIDIR port on an instantiated design (1).
+
+## Routing fields against what the product terms need (2026-11-26)
+Taking block input m to feed array columns 2m and 2m+1, I tabulated each routing field's
+pattern against whether any product term in that block uses those columns:
+| chip | needed by a term | not needed |
+|---|---|---|
+| EPM7032 (2 fuses) | 00 ×25, 01 ×5, 11 ×4 | 00 ×9, 01 ×11, 10 ×4, 11 ×14 |
+| EPM7064 (3 fuses) | 111 ×42, 101 ×27, 011 ×7, 110 ×4 | 011 ×31, 111 ×31, 110 ×2 |
+| EPM7160E (4 fuses) | 1111 ×220, 1110 ×19, 1011 ×18, 1101 ×10, 0111 ×8 | 1111 ×85 |
+What this supports: on the EPM7160E every programmed field (55) is one the terms need, and with
+the two other column mappings I tried (c mod 36, mirrored) that is not so — evidence for the
+2m / 2m+1 column pairing on that device.
+What it leaves unexplained: 220 inputs that terms need have a wholly unprogrammed field. Either
+an unprogrammed field still delivers a signal (so all-ones is a selection, though the
+architecture file lists no source for that value), or the routing rows of that image are
+incomplete. On the EPM7064 the picture is worse (pattern 011 sits mostly on inputs no term
+needs), so the column pairing or the field model is wrong there. In the device the EPM7160E's
+routing fuses are five short rows (177–181) per group, four for a field and one for the E
+family's extra per-input fuse.
+I cannot resolve the routing encoding from these three images. It needs either the
+router's code or a design compiled by the original software with its report file.
+
+## Routing: two more readings tested (2026-11-26)
+A binary select has no "unused" state, so an unprogrammed field must select something. On the
+EPM7160E image, for the 220 inputs that terms need but whose field is all ones:
+- "code = value + 1" (all ones = value 14): 77 of them have no value-14 source. Rejected.
+- "code = inverted value" (all ones = value 0): every field has a value-0 source, a macrocell
+  feedback; 206 of the 220 would come from macrocells that carry logic and 14 from idle ones.
+  Not contradicted, but under it the design would use only values 0, 1, 2, 4, 8 — still the
+  one-fuse-at-most pattern, which a free binary choice would not produce.
+The E family's extra per-input fuses (one in each field's fifth row, one in a separate block)
+are all unprogrammed in this image. Still unresolved; I am leaving the routing question until
+there is new information (router code or a reference design).
+
+## Programmed-fuse density by region (2026-11-26)
+| chip | array (80-cell rows) | options (16-cell rows) | routing (16-cell rows) |
+|---|---|---|---|
+| EPM7032 | 17.3% | 46.7% | 61.1% (rows 100–105) |
+| EPM7064 | 22.1% | 52.9% | 16.4% (rows 128–226) |
+| EPM7160E | 18.9% | 56.6% | 3.0% (rows 129–181) |
+The short rows that hold option fuses read with a healthy density on all three chips, so short
+rows as such are not being misread. The routing rows of the two larger chips are sparse, and
+they are also exactly the rows numbered 128 and up, which use the second row-select chain. I
+cannot tell from the images whether those rows are genuinely sparse or are being read
+incompletely; both the emulated vendor module and the native code read them the same way. On
+the EPM7064 a field's three fuses are three consecutive rows (128–130 for block 1, 160–162,
+192–194, 224–226), so "one programmed fuse per field" means one row out of three per input.
+A way to test the read path on hardware: program a known pattern into an upper row of a
+sacrificial chip and read it back — a write test, so it needs the owner's go-ahead.
+
+## Upper rows read at full length: nothing hidden (2026-11-26, hardware, read-only)
+On B9513 (native read path, 2.0 V margin) I read rows 100, 129, 147, 178–181 and 128 both as the
+device file describes them (16 cells) and with all 80 clocks. In every row the 16-cell read
+equals positions 0, 5, 10 … of the 80-clock read, and no other position holds anything but
+erased cells. So the sparse routing rows are not sparse because data sits in positions the
+16-cell read skips. Whether programmed bits in those rows fail to read at all is still open;
+only a write-and-read-back test can tell.
+
+## Option elements: evidence and hypotheses (2026-11-26)
+Values per element on the three chip images (macrocell counts):
+| element | EPM7032 (32) | EPM7064 (64) | EPM7160E (160) |
+|---|---|---|---|
+| 24 / 25 (terms 0, 1) | all 1 / all 1 | 54×1 / 53×1 | all 0 / 135×0 |
+| 26 (term 2) | 20×1, 12×0 | 42×1, 22×0 | 123×1, 37×0 |
+| 27 (term 3) | 20×0, 12×1 | 41×0, 23×1 | 142×0, 18×1 |
+| 28 (term 4) | all 0 | all 0 | 136×0, 24×1 |
+| 1 | all 0 | all 0 | 82×1, 78×0 |
+| 6 | all 1 | 61×1, 3×0 | 146×0, 14×1 |
+| 29 | 31×0 | 32×0, 32×1 | 102×0, 58×1 |
+| 30 | 24×0, 8×1 | all 0 | 144×1, 16×0 |
+| 31 (2 fuses) | 25×2, 7×3 | 32×2, 20×3, 12×0 | 145×2, 15×3 |
+On the EPM7160E the common combinations are: term 3 = type 2 with literals and element 1 = 0
+(77 macrocells); term 3 = type 5, empty, element 1 = 1 (51 macrocells).
+Hypotheses, in decreasing confidence — none confirmed against a known design:
+1. Type 2 on term 3 is the register's product-term clock and type 5 a clock enable used with
+   a global clock; element 1 chooses between them (0 = product-term clock, 1 = global clock with
+   enable). Fits asm.dll's case for element 1 (it tests two alternative register flags, 0x200
+   and 0x100, and lists exactly these two virtual terms), fits the EPM7160E pattern (an empty
+   enable term is always true), and matches the term roles of the ATF150x family, which is
+   pin-compatible with these parts.
+2. By the same analogy type 3 on term 2 would be asynchronous clear and type 4 on term 4
+   asynchronous preset; type 1 (terms 0 and 1) the XOR / expander input.
+3. Element 6 separates registered from combinational macrocells (asm.dll sets it from flag 0x40
+   versus flags 0x300). Which value is which is NOT settled: the EPM7160E image suggests 0 =
+   registered (146 macrocells, most with clock terms), but the EPM7032 image has element 6 = 1
+   everywhere together with 19 macrocells whose term 3 is a type-2 term with literals, which
+   reads oddly if 1 meant "no register".
+Elements 29, 30, 31, 32 and the E family's 81–84, 67: only the flags they test are known.
+
+## Resource fitting (2026-11-26)
+`apu/fit.py` packs a synthesised design into a MAX 7000 device's macrocells and logic array
+blocks: one macrocell per register and per output that is not just a register's output; five
+product terms each, less one for each product-term clock, clear, preset or enable; wider sums
+borrow whole macrocells through parallel expanders up to 20 terms; the input pin clocking most
+registers becomes the global clock and the commonest single-pin clear the global clear; cells
+are placed greedily so each block stays within 16 macrocells and 36 input signals.
+`python -m apu fit x.tdf --device EPM7032` prints the placement. It is a resource check only:
+no routing, pins or fuses, and the product-term roles it assumes are the hypotheses above.
+
+## Pin assignment in the fit (2026-11-26)
+`fit.assign_pins()` numbers the placed cells' macrocells (a cell's lenders take the numbers just
+below it) and assigns pins from the device file's `pin_mc` table: outputs on their macrocell's
+pin, the global clock and clear on the dedicated pins (43 and 1 on the 44-pin package, 83 and 1
+on the 84-pin; output enables 44/2 and 84/2, which the device file's `oe_pin` table confirms),
+other inputs on the pins of macrocells whose output is not brought out, then spare dedicated
+inputs. `python -m apu fit` prints the pin list. User pin assignments, and checking them
+against what the router can reach, are not implemented.
+
+## Routing decode CONFIRMED on the EPM7032 (2026-11-26)
+Test: on the real EPM7032, take the block inputs that product terms use, decode each field as a
+two-fuse binary number, and list the I/O-entry sources selected.
+- First fuse = high bit: the I/O entries used are 8, 16 and 18 (numbered from 0) — the pins of
+  macrocells 9, 17 and 19, which are **exactly** the three macrocells whose element 34 is 0.
+  All feedback sources used are macrocells that carry logic.
+- First fuse = low bit: eight I/O entries are used, most of them pins of macrocells whose
+  element 34 is 3.
+So, for this device, all of these hold together: a routing field is a binary select, first fuse
+high, over the architecture file's sources; block input m feeds array columns 2m and 2m+1; HIO
+entry i (i < 32) is the pin of macrocell i + 1; and element 34 = 0 means the macrocell's output
+driver is off (pin used as an input) while 3 means it drives (2 fuses, probably the two global
+enables in between).
+`fusemap.FuseMap(daf, maf).block_inputs()` implements it and `python -m apu fuses x.jed` now
+prints EPM7032 product terms with signal names (`mcN` feedback, `pinN`, `inK` dedicated). Still
+unknown there: which column of each pair is the complement (shown `.a` / `.b`).
+Consequence for the larger chips: the same model gives contradictions on the EPM7064 image under
+every bit order (pins of driving macrocells used as inputs; 28 needed inputs with no source),
+and their routing rows are the sparse rows numbered 128 and up. With the model confirmed on the
+EPM7032, the likelier explanation is now that **rows 128 and up are not being read back
+completely on the EPM7064 and EPM7160E** (by the emulated vendor module and the native code
+alike), which would also make the images of those chips, and the copy programmed into B9513,
+incomplete in the routing rows.
+
+## Upper rows in the signature read mode: no change (2026-11-26, hardware, read-only)
+On B9513 I re-read rows 178–181 (and row 100 as a control) with the line set-up the module uses
+for the signature row (port 3 bit 3 and port 0x10 bit 5 raised) instead of the ordinary one.
+Every row returned exactly the same cells in both modes, and again afterwards in the ordinary
+mode. So the read mode does not reveal further programmed bits in the upper rows. The question
+whether those rows read back completely remains one for a write-and-read-back test.
+
+## Packaging (2026-11-26)
+`pyproject.toml` added: `pip install -e .` gives an `apu` command (same as `python -m apu`). The
+package itself needs only pyusb; unicorn, pefile and capstone are needed only by the
+emulator-based tools in `tools/`.
+
+## Literal polarity and constant terms, from asm.dll (2026-11-26)
+- asm.dll keeps the `.daf` header in globals from 0x10023720, which fixes the field order:
+  total_bits, wl_offset, pia_wl_offset, pt_offset, mc_pt_offset, lab_offset, pia_offset,
+  lab_pia_wls, pia_wls, pt_wls, arch1_bits, arch2_bits, n_pins, n_mcs, n_labs, n_data_bits, …
+  (my earlier order had three of these swapped; n_data_bits at 0x3C is confirmed). A term's
+  fuses start at (block − 1)·lab_offset + (mc_pterm + term·mc_pt_offset)·pt_offset.
+- Product-term routine 0x10004c83(source, term address, word line, invert): source 1 fills the
+  term's pt_wls fuses with 1, source −1 fills them with 0; otherwise it flips the word line's
+  low bit when the source id is negative or the invert flag is set, and writes a 0 at
+  term + word line · wl_offset. The caller's word line for a routed signal is 2 × its block
+  input index (0x10004ed8). So: **programmed (0) = literal present; block input m uses column 2m
+  for the true signal and 2m + 1 for its complement; a term with nothing programmed is the
+  constant the code calls 1 (VCC) and a fully programmed term is its inverse (GND)**. Each
+  shared expander has a single word line (table exp_wl).
+`python -m apu fuses` now prints EPM7032 terms as real literals, e.g. macrocell 2 of the chip:
+`!mc19 & !mc8 & !mc9 & !pin19 & !mc15 & !mc16`, its other four terms VCC.
+An observation that fits together (hypothesis, not confirmed): macrocells like that one have one
+term of all-inverted literals and VCC elsewhere. If term 0 there is the XOR input (type 1) and
+the sum is the constant VCC, the output is the complement of that term — a wide OR of the six
+signals done with a single product term, which is the classic De Morgan trick a fitter uses.
+That would make type 1 the XOR term.
+
+## The real EPM7032's design, decoded as far as it goes (2026-11-26)
+With names and polarity in place the chip's 32 macrocells fall into clear groups (V = constant
+true term, G = constant false; elements 24–28 written as five digits):
+- **Unused** (13, 22, 26–30): `11010`, element 31 = 3, all five terms V. This is the blank
+  pattern: an unused macrocell has term 2 and term 4 steered to their special inputs and
+  nothing programmed.
+- **One wide term** (2, 3, 5, 10, 11): `11010`, element 31 = 2, term 0 an AND of six to eight
+  inverted signals, the rest V. Same steering as an unused cell.
+- **`11100` cells** (the other twenty): term 2 in the sum position and term 3 steered away.
+  Six of them (4, 18, 21, 23, 24, 25) have term 3 = `pin19` and a single signal on term 1 that
+  chains them (32 → 25 → 24 → 18, 31 → 21, 4 → 23): they look like a shift register clocked
+  from pin 19, with term 1 as data and term 3 as clock. Five (9, 14, 15, 16, 19) have
+  term 2 = `mc12`, term 4 = `!mc20 & !mc12` and term 3 an AND of two shared expanders, as a
+  register with product-term clear, preset and clock would.
+So the term roles hypothesised earlier (term 3 clock, term 2 clear, term 4 preset) fit this
+design too. What does not fit yet: element 6 is 1 in every macrocell, used or not, including
+the ones that look registered, so "element 6 = register bypass" cannot be right as I stated
+it; and in the chained cells term 0 is V while sitting in a position my table calls "sum or
+type 1", which would force a sum to 1 unless term 0 is the XOR input there or is ignored.
+Element 6, the XOR/invert control and the exact sum membership are the open points.
+
+## Hypothesis: term 0 is the XOR input, element 31 selects it (2026-11-26)
+Reading the decoded EPM7032 design for what would make every used macrocell meaningful:
+- If the sum included term 0, the six chained cells (term 0 = VCC) would have a constant sum.
+  If instead term 0 feeds the macrocell's XOR and the sum is the remaining sum-steered terms,
+  every group works: the one-wide-term cells give the complement of their AND (a wide OR by
+  De Morgan, with the sum at VCC from the unprogrammed terms); the chained cells give the
+  complement of their single data signal (term 0 = VCC used purely to invert); unused cells
+  give VCC xor VCC.
+- Element 31 has two fuses and a four-way select in the device file (values 0–3); it is 3 on
+  every unused macrocell and 2 on every used one on this chip (and takes 0 on twelve cells of
+  the EPM7064). A two-fuse, four-way choice that differs between used and unused cells is what
+  the XOR's second-input select would look like (the data sheet's macrocell has the XOR fed by
+  a product term, a constant, or the register for T-type operation). asm.dll's case for
+  element 31 tests register flags 0x20, 0x300 and 0x400 and picks select index 1–4.
+So the working model for the EPM7032 is: XOR input = term 0 (type 1) when element 31 = 2;
+sum = the terms steered to it among 1–4; term 2 clear, term 3 clock, term 4 preset when steered
+away. Still hypothesis: no known design to check against. Element 6 (1 everywhere here), 29,
+30, 32 remain unexplained; element 30 = 1 coincides with the cells that use shared expanders or
+product-term clear/preset.
+
+## The vendor library is mostly schematics (2026-11-26)
+The user's MAX+PLUS II tree ships its macrofunction library as files, not compiled code:
+`max2inc/` holds 307 prototype include files (`FUNCTION 4count (clk, clrn, setn, ldn, cin, dnup,
+d, c, b, a) RETURNS (qd, qc, qb, qa, cout);` …) and `max2lib/mf/` holds 24 AHDL files, 306
+schematic files (`.gdf`, a binary format starting `GDF\0`) and 289 symbol files; `max2lib/prim`
+has 85 primitive symbols and `mega_lpm` the parameterised library.
+The front end now reads these at run time from the user's copy: `INCLUDE "name"` loads the
+prototypes (so inline calls get their argument order), instances are searched in the design's
+directory and then the library directories, and `IF … GENERATE … ELSE GENERATE … END GENERATE`
+is handled in VARIABLE sections and in the body, with `FAMILY_FLEX()` and the like false for a
+MAX 7000 target and `USED(port)` taken as true. All 24 old-style library `.tdf` files parse.
+But they are thin wrappers: `8count.tdf` chooses between `p8count` and `f8count`, and those,
+like `4count`, exist only as `.gdf` schematics. So simulating the tutorial designs that use
+`4count`, `8count` or `74151` needs a reader for the binary schematic format — the same thing
+schematic entry needs. Not started. The parameterised `mega_lpm` AHDL (56 of 159 files parse)
+uses more of the language than the parser handles (`?:`, `^`, `FOR … GENERATE` forms).
+
+## Schematic files (.gdf): first look (2026-11-26)
+- 8-byte header `GDF\0\0\0` + version 6, then a stream of records introduced by lower-case
+  letter tags. Visible in a small tutorial file: `j` + two u16 (a size: the sheet, and later
+  each symbol's box); `k` + four u16 + one u16 (a line: x1 y1 x2 y2 and an id); `v` + u16
+  length + NUL-terminated text (font strings such as "Arial,10", node names such as
+  "ticket[3..0]", symbol names such as "NOR2", "INPUT", "VCC"); `q`, `i`, `l`, `n`, `o`, `p`,
+  `r`, `h` carry positions and attributes; `f` … `g` appear to bracket a symbol.
+- The module that reads and writes them is `gio.dll` (276 exports). Its export names give the
+  object model: a drawing holding symbols, each with graphics, pin stubs and text; lines with a
+  node id, a wire id and a pin-stub reference (`gio_line_get_node_id`, `_get_wire_id`,
+  `_get_pinstub_rec_id`) — so connectivity is stored, not only geometry. Entry points are
+  `gio_read_drawing` (0x100167e0) and `gio_write_drawing`. Its debug-print routines have format
+  strings without field names, so the record layouts have to come from the reader's code.
+Not started beyond this. A netlist extractor for `.gdf` would unlock the library
+macrofunctions (`4count`, `8count`, `74151` exist only as schematics) and schematic entry.
+
+## Schematic files parsed (2026-11-26)
+The record layouts came from gio.dll's reader. `ged_u_io_read_label(tag)` consumes a tag and
+`ged_u_io_is_label(tag)` only tests it, so a record read after `is_label` starts with its own
+tag byte. Layouts:
+- header record `e` + four bytes; `f` + `j` w h starts a graphic;
+- lines `k` / `l` / `m`: x1 y1 x2 y2 (i16) + u16; `i` marks a named line and is followed by its
+  name text; arc `n`: six i16 + four u16; circle `o`: two i16 + two u16; pin stub `p`: two i16;
+- text `q`: u8 type, u8 font, i16 x, i16 y, u16 attributes; if font ≥ 4 a font string and two
+  i16; else in a graphic or `u` list two i16 when the type is 0x32 or 0x37; then text and
+  alternative text; in a `u` list a trailing u16. Strings: `v` + u16 length + bytes + NUL, or
+  `s` + u8 length + bytes + NUL (the length excludes the NUL — my first version had that wrong);
+- `g` opens the symbol section: per symbol a graphic, then per instance `r` x y orientation,
+  `h` and its texts, optionally `u` and more texts; `h` at top level holds sheet texts; `t` ends.
+`apu/gdf.py` parses **all 410 `.gdf` files in the vendor tree to the terminator with no bytes
+left over** (81,032 lines, 84,750 texts, 16,287 symbol instances, 8,132 pin stubs).
+What the records mean, from the tutorial and library files: text type 1 is a symbol's name,
+2 and 3 its input and output pin names (each followed by the pin stub's position), 6 a node
+name on a wire, 41 an instance's number. `gdf.symbols()` and `gdf.wires()` return these.
+The old-style library is built from about forty primitive symbols — INPUT, OUTPUT, AND2…AND8,
+OR, NAND, NOR, XOR, XNOR, NOT, the B-prefixed bubble-input gates, DFF, DFFE, TFF, JKFF, LATCH,
+TRI, SOFT, LCELL, CARRY, CASCADE, EXP, BIDIR. `4count.gdf` is 60 such symbols and 312 wires.
+Not done: the netlist — joining wires, pin stubs and names into nets — and turning it into
+logic for the simulator and synthesiser.
+
+## Schematic netlist: first attempt does not work yet (2026-11-26)
+`gdf.to_ahdl()` joins wires at shared endpoints, attaches pin stubs, and emits AHDL. On the
+library's `4count.gdf`: all 186 pins land exactly on wire ends with the stored coordinates (only
+60 with the y axis flipped, so the geometry is right), no wire in that file ends on another
+wire's interior, and the netlist has no undriven or doubly driven nets. The DFF symbol's own
+labels confirm pin 1 = Q, 2 = D, 3 = clock, 4 = CLRN, 5 = PRN. But the result is wrong: the
+converted counter loads a value yet does not count, and its flip-flops' CLRN pins come out
+driven by an XOR, which looks like the D logic. Cause not found. Suspects: the meaning of the
+line records' style word (low byte values 0–3 plus bits 6 and 7 are spread evenly over all
+line ends, so they are not simply junction dots), the `l` versus `k` line types, or how my
+simulator treats asynchronous clear and preset together.
+
+## Schematic netlists work; library macrofunctions simulate (2026-11-26)
+The converted `4count` was wrong because a symbol's pins are stored in drawing order, not by
+number, and my converter mapped primitive inputs by position in the file. Sorting by pin number
+fixes it; the DFF mapping is 2 = D, 3 = CLK, 4 = CLRN, 5 = PRN (chosen because CLRN low then
+clears the counter; the other order sets it). The converted `4count` counts up and down, gives
+carry-out at 15 and 0, loads, holds with carry-in low and clears — the behaviour of the TTL
+part it models.
+The library search now converts a `.gdf` when no `.tdf` of that name exists. Two front-end gaps
+fixed on the way: a bare `X` inside a flattened instance is the don't-care again, and
+assignments with empty positions or group arguments spread over single-bit ports
+(`(q[3..0], ) = 4count(clk, …)`, `16dmux(q[3..0])`) are split bit by bit.
+Results: 220 of the 306 library schematics convert and construct (failures: latches, JK
+flip-flops, rotated symbols, buses, a few others). Of the 40 tutorial files (38 AHDL, 2
+schematic), 33 simulate and 28 also synthesise and fit an EPM7128. `macro2` — the library's
+4-bit counter driving its 4-to-16 decoder, both converted from schematics — walks one output
+high per clock through all sixteen and wraps. Not compared with the vendor simulator.
+Left: buses, rotated symbols, latches and JK flip-flops in schematics; machine ports; a TRI
+variable; BIDIR ports on instances.
+
+## A vendor reference after all: the tutorial's compiled `chiptrip` (2026-11-26)
+The tutorial directory holds the original compiler's and simulator's output for `chiptrip`:
+`chiptrip.rpt` (MAX+PLUS II 10.0, target **EPM7032LC44-6**), `.fit`, `.snf`, `.acf` and
+`chiptrip.tbl`, the simulator's vector table. No POF, but:
+- **Simulation reference.** `apu/tbl.py` reads `.tbl` files and replays their inputs into the
+  native simulator. `python -m apu sim chiptrip.gdf chiptrip.tbl`: the schematic (converted,
+  with its four sub-designs and the library's `8count` → `p8count` schematic) matches the vendor
+  simulation in **all 80 settled values**: `at_altera`, `ticket[3..0]`, the buried 8-bit
+  counter and both state machines' state names. Altering two expected values makes the check
+  report exactly those two, so it does discriminate. Functional only; the vendor table also
+  shows delays (e.g. 2 ns clock-to-output), which are not modelled.
+- To get there the schematic converter learned user-defined symbols (name text kind 19) and
+  buses (a bus pin, port or wire name such as `dir[1..0]` becomes an AHDL group).
+- **Fitter reference** (for later): 21 logic cells, 18 shareable expanders, global clock on pin
+  43, clear `!reset` taken from an ordinary pin, XOR used with an expander-product second input
+  (`DFFE(_EQ013 $ _EQ014, GLOBAL(clock), !reset, VCC, VCC)`), Turbo and Security bits ON,
+  pin ↔ logic cell assignments (pin 4 = LC1 … pin 41 = LC17), which agree with the device
+  file's `pin_mc` table for all 18 pins the design uses.
+
+## Application window, and T flip-flops in synthesis (2026-11-26)
+- `python -m apu gui [project dir]` (`apu/gui.py`, standard library only): a local server on
+  127.0.0.1 and a page in the browser with the project's files, a source viewer (schematics are
+  shown as the AHDL they convert to), Compile (equations, fit, pins), Simulate (waveform, and
+  comparison with a `.tbl` when one is chosen) and a read-only Programmer panel (adapter and
+  silicon ID). It never writes to a chip. Tested through its HTTP API (tests/test_gui.py); the
+  page's script passes `node --check`; not yet looked at in a browser.
+- Synthesis now keeps a register's toggle form (T flip-flop: t = next ⊕ q) when that needs fewer
+  product terms, as the original compiler does for counters (TFFE in chiptrip.rpt). The
+  tutorial's 8-bit `time_cnt` now fits in 8 macrocells of one product term each — the same as
+  the vendor report — instead of 12 with expanders.
+- Whole-`chiptrip` synthesis still stops: one register of the library's `p8count` depends on 15
+  signals, over the exhaustive method's 14.

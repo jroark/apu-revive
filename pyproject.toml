@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apu-revive"
+version = "0.1.0"
+description = "Use an Altera Programming Unit (PL-APU) and work with MAX 7000 designs from macOS, without Windows"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pyusb"]
+
+[project.optional-dependencies]
+# Only the reverse-engineering tools in tools/ (which host the vendor's code in an emulator) need these.
+tools = ["unicorn", "pefile", "capstone"]
+
+[project.scripts]
+apu = "apu.__main__:main"
+
+[tool.setuptools]
+packages = ["apu"]

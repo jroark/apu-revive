@@ -78,6 +78,37 @@ class Board(unittest.TestCase):
         self.assertEqual(wire[16:26], bytes.fromhex("0190 0192 81 0191 0193 81"))
 
 
+    def test_programming_rail_codes_match_the_module(self):
+        from apu import board
+        # final DAC codes the module produced in simulation for these requests
+        vpd = {0: 0, 1000: 12, 5000: 63, 9000: 115, 10000: 128, 11000: 141, 12000: 154, 12500: 161,
+               12750: 164, 13000: 167, 13500: 174}
+        for mv, code in vpd.items():
+            self.assertEqual(board.vpd_code(mv), code, mv)
+        for mv, code in {5000: 63, 9000: 118, 12000: 160}.items():
+            self.assertEqual(board.vpg_code(mv), code, mv)
+
+    def test_supply_trim_rule(self):
+        from apu import programmer
+
+        class Fake:
+            def __init__(self, reach): self.reach, self.code = reach, None
+        calls = []
+        real_dac, real_send, real_adc = programmer._dac, programmer._send, programmer.board.adc_read
+        fake = Fake(128)
+        programmer._dac = lambda apu, chip, ch, code: calls.append(code)
+        programmer._send = lambda apu, ops: b""
+        programmer.board.adc_read = lambda apu, ch: 255 if calls[-1] >= fake.reach else 254
+        try:
+            self.assertEqual(programmer.trim_vcc(None, 5000), 128)     # as on the real unit: 127, then 128
+            self.assertEqual(calls, [127, 128])
+            fake.reach = 200
+            with self.assertRaises(RuntimeError):                       # never runs away
+                programmer.trim_vcc(None, 5000)
+        finally:
+            programmer._dac, programmer._send, programmer.board.adc_read = real_dac, real_send, real_adc
+
+
 class Rbf(unittest.TestCase):
     def test_permutation_is_involution(self):
         raw = bytes(range(117))                    # 117 + 11 = 128 bytes, two blocks
