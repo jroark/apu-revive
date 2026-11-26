@@ -39,6 +39,45 @@ class Encode(unittest.TestCase):
         self.assertNotEqual(len(p.pad_with_reads(b"\x00" * 60, 1)) % 64, 0)  # last packet is short
 
 
+class Board(unittest.TestCase):
+    def test_startup_stream(self):
+        from apu import board
+        wire, reads = p.encode(board.startup_words())
+        self.assertEqual(reads, 0)
+        self.assertEqual(wire, bytes.fromhex("0800 0801 0803 0000 41ff 42ff 48ff 49ff 4aff 0000 0901 097f"))
+
+
+    def test_dac_frames_match_the_module(self):
+        from apu import board
+        vals = lambda words: " ".join("%02x" % (w & 0xFF) for w in words)
+        # frames copied from the real start-up trace (re/traces/init_real.txt)
+        self.assertEqual(vals(board.dac_words("A", 0, 1, 45)),
+                         "c0 82 80 82 80 83 81 82 80 82 80 83 81 82 80 83 81 83 81 82 80 83 81 88 00")
+        self.assertEqual(vals(board.dac_words("B", 3, 1, 127)),
+                         "c0 83 81 83 81 83 81 82 80 83 81 83 81 83 81 83 81 83 81 83 81 83 81 84 00")
+        self.assertEqual(vals(board.dac_words("B", 0, 1, 0)),
+                         "c0 82 80 82 80 83 81 82 80 82 80 82 80 82 80 82 80 82 80 82 80 82 80 84 00")
+        with self.assertRaises(ValueError):
+            board.dac_words("C", 0, 1, 0)
+
+
+    def test_rail_codes(self):
+        from apu import board
+        self.assertEqual(board.rail_code("vcc", 5000), 127)      # the module's start code for 5 V
+        self.assertEqual(board.rail_code("vmarg", 2000), 51)
+        self.assertEqual(board.rail_code("vpd", 12000), 153)
+        with self.assertRaises(ValueError):
+            board.rail_code("vcc", 12000)
+
+    def test_adc_pass_shape(self):
+        from apu import board
+        wire, reads = p.encode(board._adc_pass_words(5, read=True))
+        self.assertEqual(reads, 8)
+        # eight idle writes, then address 0101 and four zero bits, each as idle/clock + a read
+        self.assertEqual(wire[:16], bytes.fromhex("0190") * 8)
+        self.assertEqual(wire[16:26], bytes.fromhex("0190 0192 81 0191 0193 81"))
+
+
 class Rbf(unittest.TestCase):
     def test_permutation_is_involution(self):
         raw = bytes(range(117))                    # 117 + 11 = 128 bytes, two blocks

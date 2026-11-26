@@ -7,6 +7,20 @@ This is a reverse-engineering project and a work in progress. It has been exerci
 APU with a handful of used chips. Read the status section before trusting it with a part
 you care about.
 
+## Goal
+
+A clean, native macOS replacement for MAX+PLUS II for these parts: no Altera code at run time.
+That is a long road, and today most device-level work still runs Altera's own code in an
+emulator. The emulator is being kept as a reference that every native piece is checked against.
+
+| Stage | Scope | State |
+|---|---|---|
+| 1 | Native programmer: transport, adapter ID, voltages, ID read, read-back, erase, program, verify | transport and adapter ID native; the rest hosted |
+| 2 | Native file handling: `.pcf` device data, JEDEC, POF | `.pcf` parsed, JEDEC written; POF not started |
+| 3 | Fuse-level model of the MAX 7000 (what each fuse does) | not started |
+| 4 | Logic compiler and fitter producing programming files | not started |
+| 5 | Design entry, simulation, GUI | not started |
+
 ## How it works
 
 The APU contains a Cypress EZ-USB microcontroller and a FLEX 10K FPGA. Both are loaded by the
@@ -67,6 +81,7 @@ Run from the repository root. Reading is non-destructive.
 
 ```sh
 .venv/bin/python -m apu info                               # USB descriptors
+.venv/bin/python -m apu adapter                            # adapter ID, fully native
 .venv/bin/python tools/read_siid.py EPM7064LC84-15 --real  # silicon ID
 .venv/bin/python tools/read_bulk.py EPM7064LC84-15 out.json --real
 .venv/bin/python tools/read_bulk.py EPM7064LC84-15 lo.json --real --volts vmarg=1000

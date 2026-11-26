@@ -819,3 +819,139 @@ sibling's ID and parameter codes). The other non-identifying chips may be in the
   something in row 0 that was not copied (bits 8–9 of row 0 were left unprogrammed), is unknown.
   The device has about 7,460 fuses on that bit.
 Logs: `re/traces/b9513_program.txt`, `b9513_programmed_vm*.json`.
+
+## Clues on the EPM7160E's top cell bit, from the module (2026-11-25)
+For module type 0x3b a cell value is assembled (0x1001642d) from single bits of seven port
+reads (ports 0x03, 0x06, 0x07, 0x0c, 0x10, 0x12, 0x15; 0x15 is read but unused):
+| cell bit | source | | cell bit | source |
+|---|---|---|---|---|
+| 9 (0x200) | port 0x0c bit 0 | | 4 | port 0x12 bit 4 |
+| 8 | port 0x0c bit 5 | | 3 | port 0x10 bit 3 |
+| 7 | port 0x07 bit 3 | | 2 | port 0x10 bit 4 |
+| 6 | port 0x06 bit 0 | | 1 | port 0x03 bit 1 |
+| 5 | port 0x06 bit 7 | | 0 | port 0x03 bit 5 |
+So each cell bit is one device pin sampled through the unit; bit 9 is a single line.
+The line routine sets up differently depending on the selected line: for line 0 it calls
+0x10013220(1), which for type 0x3b raises port 0x03 bit 3 and port 0x10 bit 5; for any other
+line it calls 0x10013830(1), which raises port 0x07 bit 2. This is the mechanism behind
+"bit 9 is only live after line 0 has been read": the line-0 set-up leaves two extra control
+bits asserted. Whether pgm.dll relies on that, and what those controls do on the chip, is not
+established.
+Observations on B9513 that any explanation must fit:
+- 80-cell lines: bit 9 reads 0 in every cell, blank or programmed.
+- 16-cell lines 0x59–0x69: bit 9 read 1 in all 272 cells when blank; after writing an image
+  whose cells there are all 0, low 9 bits read 0 everywhere but bit 9 still reads 1 on 10 of the
+  17 lines. So the pin can read high, and bit 9 was programmed on some lines and not others.
+- Programming was a single pass with no verify/retry; pgm.dll's real algorithm has aim,
+  challenge, verify and remedial passes (not traced).
+
+## pgm.dll's EEPROM row programmer (0x10013c08), traced (2026-11-25)
+Called from `pgm_do_programming_passes` (0x1001235b). For non-ISP hardware it logs
+"Programming EEPROM device via MEDIT" and "Using <…>auto-increment programming algorithm", then:
+1. `pgm_set_voltages(0, Tprogram, vcc, 0, vpp, 0)` with the values read from the chip
+   (0x1006e488, 0x1006e480, 0x1006e484). With `margin_mode_type` 2 and adapter class 0x0c this
+   becomes `program_setup(3, Tprogram, vcc, 0, vpp, 0)`: VCC uncapped (5000) and margin 0.
+2. `pgd_setup(0x25, (record[0] & 0x100000) ? 0 : 1, 0)`. Module flag 0x1003a218 (default 1) is only
+   used by the routines for types 0x113+, so this is a no-op for the parts handled here.
+3. For every row-table entry with a data pointer, in ascending row order:
+   `set_column_address(row)`; `program_bytes_on_column(start, count, mask, data, 0, 0)` with the
+   row's own start/count. One call per row, no verify inside this routine.
+4. `pgd_setup(0x25, 1, 0)`.
+So the structure matches `tools/program_image.py`; the differences are the set-up values:
+that tool used `program_setup(3, Tprogram, 4750, 2000, vpp, 0)` (copied from the ERASE set-up)
+where pgm.dll uses VCC 5000 and margin 0 for programming. Verify and any remedial passes are
+in the caller and not yet traced.
+
+## Project goal changed: clean native rewrite (2026-11-26)
+Goal set by the owner: a fully compatible MAX+PLUS II replacement for macOS, as a clean native
+rewrite (no Altera code at run time). The emulator host stays as the reference for checking
+native code. First native board-level operation: `apu/board.py`.
+- Without any start-up writes, port 8 reads 0 (native adapter ID came back 0; module: 55).
+- After replaying the module's first twelve start-up writes (`board.startup_words()`), the
+  native adapter-ID read returns 55 with the PLMJ7000-84 fitted, matching the module.
+  `python -m apu adapter` does: firmware, FPGA, start-up writes, adapter ID — no vendor code
+  executed (the firmware and FPGA image are still Altera's data, loaded from the user's copy).
+
+## Voltage DACs decoded (2026-11-26)
+`tools/dac_decode.py` turns the port-1 stream into DAC commands. One TLC5620 command is 25
+writes: `C0`, eleven bits (A1 A0 RNG D7..D0) each as `82|b` then `80|b`, the load strobe (`88` =
+chip A, `84` = chip B), `00`. `apu/board.py: dac_words()` reproduces three frames from the real
+start-up trace exactly (unit test).
+Channel roles, from simulation with different requested voltages (final codes):
+| request | A0 | B0 | B1 | B2 | B3 |
+|---|---|---|---|---|---|
+| vpd 12000 | 45 | 154 | 0 | 0 | ramp |
+| vpd 10000 | 45 | 128 | 0 | 0 | ramp |
+| vmarg 2000 | 45 | 154 | 0 | 51 | ramp |
+| vpg 9000 | 45 | 154 | 118 | 0 | ramp |
+So B0 = VPD (~20 V full scale), B1 = VPG, B2 = VMARG (~10 V full scale), B3 = VCC, A0 = 45 always.
+VCC is closed-loop: on the real unit for 5000 mV the module sets B3 = 127, steps it 0 → 127 one
+code at a time, then alternates 127 / 128 while taking ten reads of port 1 per step (values 00–03),
+i.e. it trims against feedback. In simulation (reads always 0) it runs to 254. The trim rule and
+the remaining ~330 non-DAC port writes of a voltage set-up (pin-driver ports) are not yet decoded.
+A separate port-1 pattern based on `90`/`92`/`91`/`93` with reads appears at start-up (probably a
+serial read of something); not decoded.
+
+## Reference checking for native code; native LED (2026-11-26)
+`tools/golden.py`: `module_ops(call, …)` runs a module call in the emulator against the replay
+device and returns its port operations; `ops_of_words()` gives the same form for a native word
+list. A native routine is accepted when the two match. First use: `board.led_words(state)`
+matches `pgd_setup(8, state, 0)` for states 1, 2 and 0 (the module prefixes one extra `F7`
+opcode-5 write). Run natively on the unit (states 1, 2, 1, 2, 0); visual result not yet reported.
+
+## Rail helpers and the on-board ADC, from the module (2026-11-26)
+The voltage set-up (0x10018950) is built from small helpers that convert millivolts to a DAC code
+and call 0x10007a60(channel, code, 1) (chip B; shadow at 0x1003b3ec + 4·channel → 0x10007910):
+| helper | rail | chip-B channel | code |
+|---|---|---|---|
+| 0x100069b0 | VPD | 0 | mV · 255 / 20000 |
+| 0x100069f0 | VPG | 1 | mV · 255 / 20000 |
+| 0x10006a20 | VMARG | 2 | mV · 255 / 10000 |
+| 0x10006850 | VCC | 3 | mV · 255 / 10000 (and 0x10006940 with the value clamped to 2500–3300) |
+The final codes seen in traces are a few counts higher than these formulas for VPD/VPG
+(154 vs 153, 118 vs 114), so 0x10007910 applies a correction or trim; not yet decoded.
+0x10007ad0(channel < 12) is a serial ADC read on the same port-1 bus: eight `90` writes, then a
+4-bit channel address clocked as `90|b`, `92|b`, data bits read back from port 1 (bit 0 data,
+bit 1 valid), with a wait on `80` + read until bit 1 is set (up to ten tries). This is the
+`90/92/91/93` pattern at start-up and the source of the port-1 reads during a voltage set-up:
+the unit measures its own rails and the module trims the DACs against the measurement.
+Other pieces of the set-up: 0x10006d10 stores a time value scaled by the delay calibration;
+0x100064f0 ("pgd_set_header") and 0x1001ad10 / 0x10018e10 configure pin drivers per device type.
+
+## Native ADC read verified on hardware (2026-11-26)
+`board.adc_read(apu, channel)` (transcribed from 0x10007ad0). All twelve channels, idle unit with
+the PLMJ7000-84 fitted, 9 V supply:
+| | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| native (after only the 12 start-up writes) | 1 | 79 | 218 | 128 | 1 | 169 | 0 | 0 | 4 | 0 | 255 | 128 |
+| module (after its full initialisation) | 1 | 184 | 225 | 128 | 0 | 168 | 0 | 0 | 4 | 0 | 255 | 128 |
+Ten channels agree to within one count. Channels 1 and 2 differ, as expected if they follow DAC
+state that the module's full initialisation sets and the native start-up does not yet.
+What each channel measures, and its scale, is not yet established.
+
+## ADC channels identified on hardware (2026-11-26)
+Native code only; each DAC stepped alone, never above about 5 V worth of code (chip in socket):
+| change | ADC channel that moved |
+|---|---|
+| B0 (VPD) 0 → 32 → 64 | ch 7: 0 → 23 → 46 |
+| B1 (VPG) 0 → 64 | ch 6: 0 → 46 |
+| B2 (VMARG) 0 → 64 → 127 | ch 3: 0 → 65 → 127 |
+| B3 (VCC) 0 → 64 → 127 | ch 3: 0 → 65 → 128 |
+| A0 45 → 90 | ch 5: 169 → 147 (inverse) |
+So ch 7 = VPD, ch 6 = VPG (about 0.72 ADC counts per DAC count, ~109 mV per count), ch 3 = the
+VCC/VMARG node (1:1 with either DAC, 39 mV per count; the two are evidently combined before the
+measurement point), ch 5 = something set inversely by DAC A0. Fixed readings: ch 1 = 185,
+ch 2 = 225, ch 8 = 4, ch 10 = 255, ch 11 = 128, the rest 0; what they measure is unknown.
+`board.RAILS`, `set_rail()` (open loop) and `read_rail()` encode this. Rails were returned to 0.
+
+## The silicon-ID read is a line read plus a bit-plane decode (2026-11-26)
+For module types 0x12–0x18 and 0x38–0x50 (0x10003658): `pgd_read_silicon_id(row, k)` =
+`set_column_address(row)`, the ordinary 80-cell line routine 0x1000ca70, then 0x10003900(cells, k).
+For the EPM7160E's group (0x10003a1c, cell width W = 10): first cell = k // 2W + (40 if k odd),
+bit = (k >> 1) % W, and the byte is that bit of eight cells spaced five apart, MSB first.
+Checked against B9550's captured row 0 (data cells F0 F7 E8 FE E8 F2 F4 F9 F0 E7 E8 E8 E1 E3 E8 EE):
+bytes 0–7 decode to `ALTERA93` and bytes 8, 9 to D7, 80 — exactly what the module's ID read
+returned on that chip. `apu/max7000.py` implements it (unit test with those values).
+So the ID and parameter codes are bit planes of the signature row; this also explains why
+copying the row's low bytes to B9513 restored its ID.
+(An older group, types 0x0a–0x15 with flag 0x1003a208 = 0, uses bit k // 10 of cells 8k … 8k+7.)
