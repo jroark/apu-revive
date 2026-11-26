@@ -1,0 +1,17 @@
+# Altera / Intel proprietary material: obtain your own copy, never commit it
+vendor/
+*.exe
+*.pdf
+re/*.asm
+
+# Personal material
+*.zip
+
+# Data read from real chips (may be someone else's design) and bulky transfer logs
+re/traces/*
+!re/traces/.gitkeep
+
+# Python
+.venv/
+__pycache__/
+*.pyc
