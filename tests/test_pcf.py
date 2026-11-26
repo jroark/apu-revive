@@ -207,6 +207,26 @@ class FuseMapTest(unittest.TestCase):
         self.assertEqual(big.pin_of[16], 4)
 
 
+class LineRead160(unittest.TestCase):
+    # (row, cells, first read?, sha256 prefix) of the vendor module's traffic for twelve line
+    # reads of an EPM7160EQC160 in simulation, delays included; row 0 is the signature row
+    REFERENCE = [(0, 80, True, '8d3e4cc5e7869173'), (1, 80, False, 'e45ec05e5cc3ad3d'), (2, 80, False, '4f59a02c93d98985'), (5, 80, False, '2b8ab059e0638a7f'), (88, 80, False, '1ddf28d70ac32ace'), (89, 16, False, '65779eb3bc0c66fb'), (90, 16, False, 'a94599f9ee5b3ed4'), (128, 80, False, 'ea55b01b8a36b15e'), (129, 16, False, '6eeab2ed70532e52'), (169, 16, False, 'e1bc1c4340aa09c3'), (192, 16, False, '59e0ed6f286395d9'), (1, 80, False, 'e45ec05e5cc3ad3d')]
+
+    def test_reads_match_the_module(self):
+        import hashlib
+        from apu import max7000
+        for row, n, first, digest in self.REFERENCE:
+            ops = max7000.line_read_ops_160(row, first, n, signature=(row == 0))
+            self.assertEqual(hashlib.sha256(repr(ops).encode()).hexdigest()[:16], digest, (row, n))
+
+    def test_decode(self):
+        from apu import max7000
+        reads = bytearray(9 * 80)
+        reads[9 * 7:9 * 8] = bytes([0x10, 0x01, 0x04, 0x48, 0x04, 0x02, 0x40, 0x04, 0x01])   # all ten bits
+        cells = max7000.cells_from_reads_160(bytes(reads))
+        self.assertEqual([(i, v) for i, v in enumerate(cells) if v], [(40, 0x3FF)])
+
+
 class LineWrite(unittest.TestCase):
     # (row, cells, sha256 prefix) of the vendor module's traffic for four consecutive line writes
     # in simulation, each cell i holding 0x300 | (i + 1); delays included

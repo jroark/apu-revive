@@ -45,7 +45,7 @@ from your copy of MAX+PLUS II):
 | Capability | State |
 |---|---|
 | Firmware download, FPGA configuration, port I/O, adapter ID, rail DACs and ADC | works on hardware |
-| EPM7160E on PLMJ7000-84: silicon ID, full read-back with margin check | works on hardware; rows 128 and up may not read back completely (see below) |
+| EPM7160E on PLMJ7000-84 and EPM7160EQC160 on PLMQ7128/7160-160: silicon ID, full read-back with margin check | works on hardware (both read back identically to the vendor module); rows 128 and up may not read back completely (see below) |
 | EPM7160E: bulk erase, programming from POF / JEDEC / image with verify | written; matches the vendor module in simulation; never run on a chip |
 | EPM7064 (84-pin) and EPM7032 (44-pin): silicon ID and read-back | written; match the vendor module in simulation; never run on a chip |
 | JEDEC and POF files, conversion between them and read-back images | works; POF layout is from the vendor converter's code, untested against a real POF |

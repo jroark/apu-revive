@@ -1824,3 +1824,22 @@ The tutorial directory holds the original compiler's and simulator's output for 
   the vendor report — instead of 12 with expanders.
 - Whole-`chiptrip` synthesis still stops: one register of the library's `p8count` depends on 15
   signals, over the exhaustive method's 14.
+
+## PLMQ7128/7160-160 and the EPM7160EQC160 (2026-11-26)
+- Adapter ID 36. The native adapter read returned 0 or 0x7F on this adapter because it skipped
+  the module's first step (opcode-5 write F7 to port 0, then ~31 no-ops); fixed in
+  `board.adapter_id`.
+- Silicon ID through the vendor module: `ALTERA93`; full read-back (170 lines) → 74773 fuses,
+  10.8 % programmed, 96 of 160 macrocells with logic.
+- Native path: this adapter puts most lines on separate ports, so its line read has the same
+  structure as the 84-pin part (110-clock flush, marker, row clocks, sixteen precharge units,
+  read loop with an interlude every 16 cells) but different ports and nine port reads per cell.
+  Aligning the two at the level of individual line changes gives a consistent one-to-one map
+  (e.g. read clock 03.7 → 10.6, row clock 03.0 → 12.7); two adapter quirks (an always-on bit 7
+  on port 0x14, port 0x10 bit 7 constant) meant transcribing rather than translating.
+  `max7000.line_read_ops_160` matches all twelve captured module reads op for op; cell bits:
+  9 = 10.2, 8 = 05.0, 7 = 11.1, 6 = 0F.6, 5 = 0F.3, 4 = 04.4, 3 = 13.6, 2 = 16.0, 1 = 14.2,
+  0 = 0D.2 (by single-bit probing in simulation). Set-up, supply release and drive table
+  recorded from the real unit and matched op for op.
+- On the chip: native `apu id --part EPM7160EQC160` gives `ALTERA93`; native `apu read` returns
+  all 170 lines **identical in all ten bits** to the vendor-module image (8416 cells).

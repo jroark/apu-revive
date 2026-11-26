@@ -10,7 +10,7 @@ PORT_STATUS = 0x08
 ADAPTER_STROBE = 0x20
 
 # Adapter IDs observed on real hardware (the module accepts many more; see re/protocol.md)
-KNOWN_ADAPTERS = {9: "PLMJ7000-44", 55: "PLMJ7000-84"}
+KNOWN_ADAPTERS = {9: "PLMJ7000-44", 36: "PLMQ7128/7160-160", 55: "PLMJ7000-84"}
 
 
 def startup_words():
@@ -34,6 +34,10 @@ def adapter_id(apu: Apu) -> int:
     From pgdmpuz.drv 0x100063a0: raise port 1 bit 5, read port 8, drop the strobe; done twice
     and the two readings must agree. The ID is the low 7 bits.
     """
+    # As the module does before reading (traffic of pgd_setup 24): set port 0's opcode-5
+    # register to F7 and let it settle. Without this the read happened to work on the
+    # PLMJ7000-84 but returns 0 or 0x7F on the PLMQ7128/7160-160.
+    apu.xfer([protocol.word(protocol.OP_WRITE5, 0x00, 0xF7)] + [protocol.word(protocol.OP_NOP)] * 31)
     readings = []
     for _ in range(2):
         apu.write_port(PORT_DAC_BUS, ADAPTER_STROBE)

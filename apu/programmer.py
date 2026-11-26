@@ -77,7 +77,9 @@ def supply_on(apu: Apu, vcc_mv: int = 5000, profile=None) -> int:
     for c in range(code + 1):
         _dac(apu, "B", 3, c)
         _send(apu, _delay(DELAY_RAMP))
-    if profile is not None and profile.small:
+    if profile is not None and profile.supply_tail is not None:
+        _send(apu, _w(0x00, 0x10) + list(profile.supply_tail))
+    elif profile is not None and profile.small:
         _send(apu, _w(0x00, 0x10) + [("W", p, 0x00) for p in profile.clear] + _w5(profile.released))
     else:
         _send(apu, _w(0x00, 0x10) + _w5([(0x03, 0x80)] + ALL_RELEASED + [(0x14, 0x1C)]
@@ -125,16 +127,28 @@ class Epm7032Reader:
         return _w(0x05, 0x00) + _w(0x0C, a0c) + _w(0x06, 0x00)
 
 
+class Epm7160eQc160Reader:
+    def __init__(self):
+        self.first = True
+
+    def read(self, apu, row, cells=max7000.LINE_CELLS, signature=False):
+        reads = bytes(_send(apu, max7000.line_read_ops_160(row, self.first, cells, signature)))
+        self.first = False
+        return max7000.cells_from_reads_160(reads, cells)
+
+
 class Profile:
     """What differs between device types in the read path."""
 
     def __init__(self, name, adapters, drive, setup_tail, release, reader, signature, verified,
-                 clear=None, released=None, small=False):
+                 clear=None, released=None, small=False, setup=None, supply_tail=None):
         self.name, self.adapters, self.drive, self.setup_tail = name, adapters, drive, setup_tail
         self.release, self.reader, self.signature, self.verified = release, reader, signature, verified
         # `small` marks the 44-pin adapter's layout: fewer ports, cleared before being released,
         # and no separate port 0x14 handling
         self.clear, self.released, self.small = clear, released, small
+        # complete op lists for adapters whose set-up differs in structure (160-pin)
+        self.setup, self.supply_tail = setup, supply_tail
 
 
 DRIVE_EPM7064_84 = [(0x03, 0xDF), (0x04, 0xFF), (0x05, 0xFF), (0x06, 0xFB), (0x07, 0xEF), (0x0B, 0xFF),
@@ -165,9 +179,28 @@ PROFILES = {
                   (0x0C, 0x00), (0x0D, 0x00)], small=True),
 }
 
+# PLMQ7128/7160-160 (adapter ID 36), recorded from the vendor module on the real unit. Verified on
+# an EPM7160EQC160-12: native read-back equal to the vendor module's in all 8416 cells.
+_PORTS_160 = (0x03, 0x04, 0x05, 0x06, 0x07, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17)
+_RELEASED_160 = [(p, 0xC0 if p in (0x10, 0x14) else 0x00) for p in _PORTS_160]
+DRIVE_EPM7160E_160 = [(0x03, 0xFE), (0x04, 0xEF), (0x05, 0xFA), (0x06, 0xFF), (0x07, 0xFF), (0x0B, 0xFB),
+                      (0x0C, 0xFF), (0x0D, 0xFB), (0x0E, 0xFF), (0x0F, 0xB3), (0x10, 0xFB), (0x11, 0xED),
+                      (0x12, 0xDB), (0x13, 0xBF), (0x14, 0x9B), (0x15, 0x73), (0x16, 0xEE), (0x17, 0xFE)]
+_SETUP_160 = ([("W", p, 0x80 if p in (0x10, 0x14) else 0x00) for p in _PORTS_160] + _w5(_RELEASED_160)
+              + _w(0x0A, 0x01) + _delay() + _w(0x0A, 0x81) + _w5([(0x14, 0x80)]) + _delay()
+              + _w5(DRIVE_EPM7160E_160)
+              + _w(0x14, 0x80) + _w(0x12, 0x00) + _w(0x0C, 0x00) + _w(0x15, 0x00) + _w(0x13, 0x00) + _w(0x0F, 0x00)
+              + _w(0x17, 0x00) + _w(0x04, 0x00) + _w(0x16, 0x00, 0x00) + _w(0x0E, 0x08, 0x00) * 120 + _delay())
+PROFILES["EPM7160EQC160"] = Profile(
+    "EPM7160EQC160", (36,), DRIVE_EPM7160E_160, [], _w(0x14, 0x80) + _w(0x13, 0x00) + _w(0x16, 0x00) + _w(0x17, 0x00),
+    Epm7160eQc160Reader, lambda cells: bytes(max7000.signature_byte(cells, k) for k in range(12)), verified=True,
+    setup=_SETUP_160, supply_tail=_w5(_RELEASED_160))
+
 
 def read_setup_ops(profile):
     """The pin and line set-up between the two supply trims of a read set-up."""
+    if profile.setup is not None:
+        return list(profile.setup)
     if profile.small:
         ops = [("W", p, 0x02 if p == 0x03 else 0x00) for p in profile.clear]
         ops += _w5(profile.released) + _w(0x0A, 0x01) + _delay() + _w(0x0A, 0x81) + _delay()

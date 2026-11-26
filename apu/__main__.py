@@ -36,7 +36,7 @@ def cmd_adapter(args):
     print("adapter ID %d (%#x): %s" % (aid, aid, board.KNOWN_ADAPTERS.get(aid, "unknown")))
 
 
-DEVICE_FILES = {"EPM7160E": "e7160084.pcf", "EPM7064": "m7064084.pcf", "EPM7032": "m7032044.pcf"}
+DEVICE_FILES = {"EPM7160E": "e7160084.pcf", "EPM7160EQC160": "e7160120.pcf", "EPM7064": "m7064084.pcf", "EPM7032": "m7032044.pcf"}
 
 
 def _open_for(args):
@@ -330,7 +330,7 @@ def main():
         if name == "read":
             c.add_argument("out", help="JSON file to write")
             c.add_argument("--vmarg", type=int, default=2000, help="margin voltage in mV (default 2000)")
-        c.add_argument("--part", default="EPM7160E", help="device type: EPM7160E (default), EPM7064 or EPM7032")
+        c.add_argument("--part", default="EPM7160E", help="device type: EPM7160E (default), EPM7160EQC160, EPM7064 or EPM7032")
         c.add_argument("--pcf", help="device file (default: the 84-pin one for the part)")
         c.add_argument("--allow-unverified", action="store_true",
                        help="run a device whose native sequences have only been checked in simulation")

@@ -343,3 +343,59 @@ def cells_from_reads_7032(reads, count: int = LINE_CELLS):
         value = (reads[s] >> CELL_BITS_7032[0] & 1) << 1 | (reads[s] >> CELL_BITS_7032[1] & 1)
         cells[15 - s if count == 16 else count + s // 16 - 5 * (s % 16 + 1)] = value
     return cells
+
+
+# --- EPM7160E in the 160-pin package on the PLMQ7128/7160-160 (module type 0x3d) ------------------
+# Transcribed from the module's traffic in simulation. The same protocol as the 84-pin part on
+# different lines (one line per port on this adapter, so more writes), with nine port reads per
+# cell.
+READ_PORTS_160 = (0x04, 0x05, 0x0D, 0x0F, 0x10, 0x11, 0x13, 0x14, 0x16)
+_CLOCK_160 = _W(0x12, 0x80, 0x00)
+_PRECHARGE_BODY_160 = (_W(0x0E, 0x08, 0x00) * 4
+                       + _W(0x14, 0x88) + _W(0x12, 0x10) + _W(0x0C, 0x04) + _W(0x15, 0x20) + _W(0x13, 0x10)
+                       + _W(0x0F, 0x02) + _W(0x17, 0x04) + _W(0x04, 0x04) + _W(0x16, 0x40, 0x60) + _W(0x0E, 0x08, 0x00))
+
+
+def _precharge_head_160(first):
+    return (_W(0x14, 0x80) + _W(0x12, 0x00) + _W(0x0C, 0x00) + _W(0x15, 0x00) + _W(0x13, 0x00) + _W(0x0F, 0x00)
+            + _W(0x17, 0x00) + _W(0x04, 0x00) + _W(0x16, 0x00 if first else 0x20, 0x00))
+
+
+def line_read_ops_160(row: int, first: bool = True, cells: int = LINE_CELLS, signature: bool = False):
+    short = _delay(4)
+    ops = _delay(DELAY_LONG) if first else _W(0x14, 0x80) + _W(0x13, 0x00) + _W(0x16, 0x00) + _W(0x17, 0x00)
+    ops += _W(0x0F, 0x00) + _W(0x11, 0x00) + _W(0x17, 0x00) + _CLOCK_160 * 110
+    ops += (_W(0x0F, 0x00) + _W(0x11, 0x01) + _W(0x17, 0x40)) if row < 128 else \
+        (_W(0x0F, 0x01) + _W(0x11, 0x00) + _W(0x17, 0x00))
+    ops += _CLOCK_160 + _W(0x0F, 0x00) + _W(0x11, 0x00) + _W(0x17, 0x00) + _CLOCK_160 * (row % 128)
+    for i in range(16):
+        ops += _precharge_head_160(i == 0) + _PRECHARGE_BODY_160
+    ops += _precharge_head_160(False)
+    ops += (_W(0x16, 0x04) + _W(0x17, 0x80)) if signature else _W(0x13, 0x01)
+    ops += _W(0x10, 0xC0) + short + _W(0x14, 0x81) + short + _W(0x10, 0x80)
+    for cell in range(cells):
+        ops += [("R", p, None) for p in READ_PORTS_160]
+        if cell == cells - 1:
+            break
+        if cell % 16 == 15:
+            ops += (_W(0x14, 0x80) + short + _W(0x0E, 0x08, 0x00) + short + _W(0x10, 0xC0) + short
+                    + _W(0x14, 0x81) + short + _W(0x10, 0x80))
+        else:
+            ops += _W(0x10, 0xC0, 0x80)
+    return ops
+
+
+# cell bit (9 down to 0) <- (index into READ_PORTS_160, port bit); found by feeding single bits
+# to the module in simulation
+CELL_BITS_160 = ((4, 2), (1, 0), (5, 1), (3, 6), (3, 3), (0, 4), (6, 6), (8, 0), (7, 2), (2, 2))
+
+
+def cells_from_reads_160(reads, count: int = LINE_CELLS):
+    cells = [0] * count
+    for s in range(count):
+        chunk = reads[9 * s:9 * s + 9]
+        value = 0
+        for idx, bit in CELL_BITS_160:
+            value = (value << 1) | ((chunk[idx] >> bit) & 1)
+        cells[15 - s if count == 16 else count + s // 16 - 5 * (s % 16 + 1)] = value
+    return cells
