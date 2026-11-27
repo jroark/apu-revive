@@ -10,7 +10,7 @@ PORT_STATUS = 0x08
 ADAPTER_STROBE = 0x20
 
 # Adapter IDs observed on real hardware (the module accepts many more; see re/protocol.md)
-KNOWN_ADAPTERS = {9: "PLMJ7000-44", 36: "PLMQ7128/7160-160", 55: "PLMJ7000-84"}
+KNOWN_ADAPTERS = {9: "PLMJ7000-44", 35: "PLMQ7192-160", 36: "PLMQ7128/7160-160", 55: "PLMJ7000-84"}
 
 
 def startup_words():

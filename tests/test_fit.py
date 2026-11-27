@@ -12,12 +12,17 @@ class Fitting(unittest.TestCase):
         self.assertIn("2 of 32 macrocells used", result.report())
 
     def test_counter_uses_global_clock_and_clear(self):
+        # the global clear pin is active low, so it implements clrn = clr_n but not clrn = !clr
+        # (an active-high clear input becomes a product-term clear, as MAX+PLUS II does)
         result = fit.fit(synth.synthesise(COUNTER), "EPM7032", 32)
-        self.assertEqual((result.global_clock, result.global_clear), ("clk", "!clr"))
+        self.assertEqual((result.global_clock, result.global_clear), ("clk", None))
         regs = [c for c in result.cells if c.registered]
         self.assertEqual(len(regs), 4)
         controls = lambda c: {k: v for k, v in c.special.items() if k != "mode"}
-        self.assertTrue(all(controls(c) == {"clk": "global:clk", "clrn": "global:clr"} for c in regs))
+        self.assertTrue(all(controls(c) == {"clk": "global:clk", "clrn": "term"} for c in regs))
+        result = fit.fit(synth.synthesise(COUNTER.replace("count[].clrn = !clr;", "count[].clrn = clr;")), "EPM7032", 32)
+        self.assertEqual((result.global_clock, result.global_clear), ("clk", "clr"))
+        self.assertTrue(all(controls(c) == {"clk": "global:clk", "clrn": "global:clr"} for c in result.cells if c.registered))
         # q[] only repeats the registers, so the pins need no macrocells of their own; "top" does
         self.assertEqual(sorted(c.name for c in result.cells if not c.registered), ["top"])
 
@@ -33,7 +38,7 @@ class Fitting(unittest.TestCase):
         pin_mc = [0] * 45
         for mc in range(1, 33):
             pin_mc[mc + 3] = mc
-        net = synth.synthesise(COUNTER)
+        net = synth.synthesise(COUNTER.replace("count[].clrn = !clr;", "count[].clrn = clr;"))
         result = fit.fit(net, "EPM7032", 32)
         placement, pins = fit.assign_pins(result, net, pin_mc)
         self.assertEqual((pins["clk"], pins["clr"]), (43, 1))                 # dedicated clock and clear pins

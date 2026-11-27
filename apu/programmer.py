@@ -137,6 +137,16 @@ class Epm7160eQc160Reader:
         return max7000.cells_from_reads_160(reads, cells)
 
 
+class Epm7192eQc160Reader:
+    def __init__(self):
+        self.first = True
+
+    def read(self, apu, row, cells=max7000.LINE_CELLS, signature=False):
+        reads = bytes(_send(apu, max7000.line_read_ops_7192(row, self.first, cells, signature)))
+        self.first = False
+        return max7000.cells_from_reads_7192(reads, cells)
+
+
 class Profile:
     """What differs between device types in the read path."""
 
@@ -195,6 +205,24 @@ PROFILES["EPM7160EQC160"] = Profile(
     "EPM7160EQC160", (36,), DRIVE_EPM7160E_160, [], _w(0x14, 0x80) + _w(0x13, 0x00) + _w(0x16, 0x00) + _w(0x17, 0x00),
     Epm7160eQc160Reader, lambda cells: bytes(max7000.signature_byte(cells, k) for k in range(12)), verified=True,
     setup=_SETUP_160, supply_tail=_w5(_RELEASED_160))
+
+
+# PLMQ7192-160 (adapter ID 35), recorded from the vendor module on the real unit. Verified on an
+# EPM7192EQC160-12: native read-back equal to the vendor module's in all 8608 cells.
+_PORTS_7192 = (0x03, 0x04, 0x05, 0x06, 0x07, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15)
+_RELEASED_7192 = [(p, 0xF0 if p == 0x0D else 0x00) for p in _PORTS_7192]
+DRIVE_EPM7192E_160 = [(0x03, 0xDF), (0x04, 0xEF), (0x05, 0xFF), (0x06, 0xBF), (0x07, 0xBE), (0x0B, 0xF5),
+                      (0x0C, 0x00), (0x0D, 0xD0), (0x0E, 0xEF), (0x0F, 0xF7), (0x10, 0xFF), (0x11, 0xC6),
+                      (0x12, 0xF7), (0x13, 0xEF), (0x14, 0xEF), (0x15, 0xFB)]
+_SETUP_7192 = ([("W", p, 0x90 if p == 0x0D else 0x00) for p in _PORTS_7192] + _w5(_RELEASED_7192)
+               + _w(0x0A, 0x01) + _delay() + _w(0x0A, 0x81) + _delay() + _w5(DRIVE_EPM7192E_160)
+               + _w(0x0B, 0x00) + _w(0x06, 0x00) + _w(0x10, 0x00) + _w(0x11, 0x00) + _w(0x13, 0x00)
+               + _w(0x07, 0x00) + _w(0x15, 0x00) + _w(0x12, 0x00) + _w(0x14, 0x00)
+               + _w(0x0E, 0x04, 0x00) * 120 + _delay())
+PROFILES["EPM7192EQC160"] = Profile(
+    "EPM7192EQC160", (35,), DRIVE_EPM7192E_160, [], _w(0x0B, 0x00) + _w(0x14, 0x00) + _w(0x04, 0x00) + _w(0x0E, 0x00),
+    Epm7192eQc160Reader, lambda cells: bytes(max7000.signature_byte(cells, k) for k in range(12)), verified=True,
+    setup=_SETUP_7192, supply_tail=_w5(_RELEASED_7192))
 
 
 def read_setup_ops(profile):

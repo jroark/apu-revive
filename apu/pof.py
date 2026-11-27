@@ -206,3 +206,34 @@ def pof_to_image(pof: Pof, blank: int = 0x3FF):
                 k = e.start_row + j
                 line[k] = (line[k] & ~e.mask) | (values[i * e.row_count + j] & e.mask)
     return rows
+
+
+# --- logical fuse data -----------------------------------------------------------------------
+# What MAX+PLUS II 10.2 itself writes for MAX 7000 parts (checked on EPM7032LC44 POFs from the
+# vendor compiler, 2026-11-26): no electrical packets, one logical packet (tag 17) with start
+# address 0, address_count = the device's JEDEC fuse count, and the fuses packed eight to a
+# byte, most significant bit first, in JEDEC order with no inversion.
+def logical_fuses(pof: Pof):
+    """The JEDEC fuse list from a POF's logical packets, or None if it has none."""
+    packets = pof.logical()
+    if not packets:
+        return None
+    total = max(p.start_address + p.address_count for p in packets)
+    fuses = [1] * total
+    for p in packets:
+        for i in range(p.address_count):
+            fuses[p.start_address + i] = (p.data[i >> 3] >> (7 - (i & 7))) & 1
+    return fuses
+
+
+def fuses_to_logical_pof(fuses, device: str, creator: str = "apu-revive") -> Pof:
+    """A POF in the form MAX+PLUS II writes for MAX 7000 parts (see logical_fuses)."""
+    out = Pof()
+    out.add_text(TAG_CREATOR, creator)
+    out.add_text(TAG_DEVICE, device)
+    data = bytearray((len(fuses) + 7) // 8)
+    for i, bit in enumerate(fuses):
+        if bit:
+            data[i >> 3] |= 0x80 >> (i & 7)
+    out.add(Logical(0, 0, len(fuses), 1, bytes(data), wide=True))
+    return out

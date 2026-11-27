@@ -1,0 +1,5 @@
+SUBDESIGN tdev_epm7032slc4410
+( a, b : INPUT; y : OUTPUT; )
+BEGIN
+	y = a & b;
+END;

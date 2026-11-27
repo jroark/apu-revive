@@ -1,0 +1,4 @@
+CHIP p05_clr_pre
+BEGIN
+	DEVICE = EPM7032LC44-15;
+END;

@@ -1,0 +1,9 @@
+SUBDESIGN s05_dedicated
+( g43, g1, g44, g2, a : INPUT;
+  y43, y1, y44, y2 : OUTPUT; )
+BEGIN
+	y43 = g43 & a;
+	y1 = g1 & !a;
+	y44 = g44 # a;
+	y2 = !g2 & a;
+END;

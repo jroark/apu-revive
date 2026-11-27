@@ -1,0 +1,32 @@
+CHIP s02_regs
+BEGIN
+	DEVICE = EPM7032LC44-15;
+	|clk : INPUT_PIN = 43;
+	|gclr : INPUT_PIN = 1;
+	|a0 : INPUT_PIN = 4;
+	|b0 : INPUT_PIN = 5;
+	|a1 : INPUT_PIN = 6;
+	|b1 : INPUT_PIN = 7;
+	|a2 : INPUT_PIN = 8;
+	|b2 : INPUT_PIN = 9;
+	|a3 : INPUT_PIN = 11;
+	|b3 : INPUT_PIN = 12;
+	|a4 : INPUT_PIN = 13;
+	|b4 : INPUT_PIN = 14;
+	|n1 : OUTPUT_PIN = 41;
+	|n2 : OUTPUT_PIN = 40;
+	|n3 : OUTPUT_PIN = 39;
+	|n4 : OUTPUT_PIN = 38;
+	|n5 : OUTPUT_PIN = 37;
+	|r1 : OUTPUT_PIN = 36;
+	|r2 : OUTPUT_PIN = 34;
+	|r3 : OUTPUT_PIN = 33;
+	|r4 : OUTPUT_PIN = 32;
+	|r5 : OUTPUT_PIN = 31;
+	|rpc : OUTPUT_PIN = 29;
+	|rcl : OUTPUT_PIN = 28;
+	|rpr : OUTPUT_PIN = 27;
+	|ren : OUTPUT_PIN = 26;
+	|rt : OUTPUT_PIN = 25;
+	|rgc : OUTPUT_PIN = 24;
+END;

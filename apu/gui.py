@@ -3,8 +3,10 @@ browser. Standard library only. `python -m apu gui [project directory]`.
 
 Panels: the project's design files; a source viewer; Compile (parse, synthesise, fit, pins);
 Simulate (functional, from a .tbl's inputs or from a clock count, drawn as a waveform, with the
-vendor's expected values compared when a .tbl is used); Programmer (adapter ID and silicon ID,
-read-only). Nothing in this app writes to a chip.
+vendor's expected values compared when a .tbl is used); Programmer (APU adapter ID and silicon ID;
+EPM7064S on a USB-Blaster: ID and full read-back to a POF), all read-only. Compile writes
+programming files (POF, JEDEC, and an SVF for the EPM7064S) for the EPM7032 and EPM7064S.
+Nothing in this app writes to a chip: program with `apu jtag program file.pof --yes`.
 """
 import html
 import json
@@ -69,21 +71,47 @@ class Project:
         raise ValueError("cannot show %s" % name)
 
     def compile(self, name, device):
-        from . import daf, fit, synth
+        from . import acf, daf, fit, fusemap, jedec, maf, parts, pof, project, synth
         from .__main__ import FIT_DEVICES
         device = device.upper()
         if device not in FIT_DEVICES:
             raise ValueError("unknown device %s" % device)
-        device_file = daf.parse((self.vendor.parent / "7k" / FIT_DEVICES[device]).read_bytes())
+        k = self.vendor.parent / "7k"
         net = synth.synthesise(self.design_text(name), self.resolver())
-        result = fit.fit(net, device, daf.summary(device_file)["macrocells"])
-        try:
-            _, pins = fit.assign_pins(result, net, device_file.tables["pin_mc"])
-        except fit.DoesNotFit as e:
-            pins = {"(failed)": str(e)}
-        return {"equations": net.report(), "fit": result.report(),
-                "pins": sorted(pins.items(), key=lambda kv: (isinstance(kv[1], str), kv[1])),
-                "note": "Resource fit only: signals are not routed and no programming file is produced."}
+        design = self.path(name)
+        acf_path = design.with_suffix(".acf")
+        fixed = acf.pins(acf.parse(acf_path.read_text(encoding="latin1")), design.stem) if acf_path.exists() else {}
+        part_name = {"EPM7032": "EPM7032LC44", "EPM7064S": "EPM7064SLC44"}.get(device)
+        if part_name is None:                            # resource fit only for the others
+            device_file = daf.parse((k / FIT_DEVICES[device]).read_bytes())
+            result = fit.fit(net, device, daf.summary(device_file)["macrocells"])
+            try:
+                _, pins = fit.assign_pins(result, net, device_file.tables["pin_mc"])
+            except fit.DoesNotFit as e:
+                pins = {"(failed)": str(e)}
+            return {"equations": net.report(), "fit": result.report(),
+                    "pins": sorted(pins.items(), key=lambda kv: (isinstance(kv[1], str), kv[1])),
+                    "note": "Resource fit only for %s: no programming file is produced (EPM7032 and EPM7064S only)." % device}
+        part = parts.lookup(parts.load(self.vendor / "partinfo.crf"), part_name)
+        written = []
+        if device == "EPM7064S":
+            from . import generate7064s, svf7064s
+            fm = fusemap.FuseMap(daf.parse((k / "s7064044.daf").read_bytes()), maf.parse((k / "m7064s.maf").read_bytes()))
+            fuses, fitted = generate7064s.compile_netlist(net, part, k, fixed, fm)
+            design.with_suffix(".svf").write_text(svf7064s.write(fuses, "program"))
+            written.append(design.with_suffix(".svf").name)
+        else:
+            from . import generate
+            fitted = project.fit_part(net, part, k, fixed)
+            fm = fusemap.FuseMap(daf.parse((k / "m7032044.daf").read_bytes()), maf.parse((k / "m7032.maf").read_bytes()))
+            fuses = generate.generate(net, fitted.result, fitted.placement, fitted.pins, fm)
+        design.with_suffix(".pof").write_bytes(pof.fuses_to_logical_pof(fuses, part_name, "apu-revive").to_bytes())
+        design.with_suffix(".jed").write_bytes(jedec.write(fuses, "Compiled by apu-revive from %s" % design.name,
+                                                           device=part_name).encode("latin1"))
+        written = [design.with_suffix(".pof").name, design.with_suffix(".jed").name] + written
+        return {"equations": net.report(), "fit": fitted.result.report(),
+                "pins": sorted(fitted.pins.items(), key=lambda kv: kv[1]),
+                "note": "Programming files written: %s." % ", ".join(written)}
 
     def simulate(self, name, tbl_name=None, clocks=16, clock="clk"):
         from . import ahdl_eval, tbl
@@ -121,6 +149,19 @@ class Project:
                     sim.set(**{clock: 0}); sample("%d down" % (k + 1))
         return {"signals": signals, "trace": [[label, [vals[s] for s in signals]] for label, vals in trace],
                 "checks": checks, "mismatches": [list(m) for m in mismatches[:50]]}
+
+    def jtag(self, action, name=None):
+        """EPM7064S on a USB-Blaster, read-only: its ID, or a full read-back to <name>.pof."""
+        from . import jtag, pof
+        with self.lock, jtag.Openocd() as ocd:
+            code = jtag.idcode(ocd)
+            out = {"idcode": "%08X" % code, "device": "EPM7064S" if code == jtag.IDCODE_EPM7064S else "unknown"}
+            if action == "read" and code == jtag.IDCODE_EPM7064S:
+                fuses = jtag.read_fuses(ocd)
+                target = self.dir / ((pathlib.Path(name).stem if name else "chip") + "_readback.pof")
+                target.write_bytes(pof.fuses_to_logical_pof(fuses, "EPM7064SLC44", "apu-revive").to_bytes())
+                out.update(fuses=len(fuses), programmed=fuses.count(0), written=target.name)
+            return out
 
     def programmer(self):
         from . import board, programmer
@@ -173,12 +214,14 @@ PAGE = """<!DOCTYPE html>
  <div id="bar">
   <b id="cur">no file selected</b>
   <button onclick="show()">Source</button>
-  <select id="dev"><option>EPM7032</option><option>EPM7064</option><option>EPM7096</option><option>EPM7128</option><option>EPM7160E</option></select>
+  <select id="dev"><option>EPM7032</option><option>EPM7064</option><option>EPM7096</option><option>EPM7128</option><option>EPM7160E</option><option>EPM7064S</option></select>
   <button onclick="comp()">Compile</button>
   <select id="tbl"><option value="">clock only</option></select>
   <button onclick="simu()">Simulate</button>
   <span style="flex:1"></span>
-  <button onclick="prog()">Programmer: read ID</button>
+  <button onclick="prog()">APU: read ID</button>
+  <button onclick="jt('id')">USB-Blaster: ID</button>
+  <button onclick="jt('read')">USB-Blaster: read chip</button>
  </div>
  <div id="out"><p>Select a design file on the left.</p></div>
 </div>
@@ -221,6 +264,8 @@ async function simu(){ if(!cur) return; busy('Simulating…');
     out.innerHTML=h+'</table><p><i>Functional simulation (no delays). Each column is one step.</i></p>'}catch(e){fail(e)} }
 async function prog(){ busy('Talking to the programmer…');
   try{const j=await api('programmer'); out.innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre><p><i>Read-only: this app never writes to a chip.</i></p>'}catch(e){fail(e)} }
+async function jt(a){ busy('Talking to the USB-Blaster…');
+  try{const j=await api('jtag',{action:a,name:cur||''}); out.innerHTML='<pre>'+esc(JSON.stringify(j,null,2))+'</pre><p><i>Read-only. To program: apu jtag program file.pof --yes</i></p>'}catch(e){fail(e)} }
 load();
 </script></body></html>
 """
@@ -258,6 +303,10 @@ def make_handler(project):
                     result = project.simulate(q["name"], q.get("tbl") or None, int(q.get("clocks", 16)))
                 elif action == "programmer":
                     result = project.programmer()
+                elif action == "jtag":
+                    if q.get("action") not in ("id", "read"):
+                        raise ValueError("the app only reads chips")
+                    result = project.jtag(q["action"], q.get("name") or None)
                 else:
                     return self.send(404, json.dumps({"error": "unknown action"}))
                 self.send(200, json.dumps(result))

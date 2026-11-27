@@ -1,0 +1,14 @@
+CHIP s03_parallel
+BEGIN
+	DEVICE = EPM7032LC44-15;
+	|a0 : INPUT_PIN = 4;
+	|a1 : INPUT_PIN = 5;
+	|a2 : INPUT_PIN = 6;
+	|a3 : INPUT_PIN = 7;
+	|a4 : INPUT_PIN = 8;
+	|a5 : INPUT_PIN = 9;
+	|a6 : INPUT_PIN = 11;
+	|a7 : INPUT_PIN = 12;
+	|y7 : OUTPUT_PIN = 38;
+	|y9 : OUTPUT_PIN = 28;
+END;

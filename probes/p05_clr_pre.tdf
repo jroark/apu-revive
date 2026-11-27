@@ -1,0 +1,13 @@
+SUBDESIGN p05_clr_pre
+( clk, d, rst, setn, a : INPUT;
+  q_gclr, q_ptclr, q_pre : OUTPUT; )
+VARIABLE
+	r1, r2, r3 : DFF;
+BEGIN
+	r1.clk = clk;  r1.d = d;  r1.clrn = rst;
+	r2.clk = clk;  r2.d = d;  r2.clrn = !(a & d);
+	r3.clk = clk;  r3.d = d;  r3.prn = setn;
+	q_gclr = r1;
+	q_ptclr = r2;
+	q_pre = r3;
+END;

@@ -1,0 +1,7 @@
+SUBDESIGN p07_tri
+( a, b, oe : INPUT;
+  y_goe, y_ptoe : OUTPUT; )
+BEGIN
+	y_goe = TRI(a, oe);
+	y_ptoe = TRI(a, a & b);
+END;

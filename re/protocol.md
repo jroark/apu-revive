@@ -1843,3 +1843,517 @@ The tutorial directory holds the original compiler's and simulator's output for 
   recorded from the real unit and matched op for op.
 - On the chip: native `apu id --part EPM7160EQC160` gives `ALTERA93`; native `apu read` returns
   all 170 lines **identical in all ten bits** to the vendor-module image (8416 cells).
+
+## Steering rule corrected for the E family (2026-11-26)
+On the EPM7160EQC160 image 65 terms with literals came out with no role. Two causes in my
+combining rule: element 82 (E family only) lists a single (equation, term) pair and reads 1 on
+every macrocell of both E-family chips read so far, so it is treated as a dependency note, not a
+select; and element 25's table names a term-0 pair, which the rule let it veto. Now each element
+decides only the term most of its entries name, and only when it chooses between two or more
+roles there. Result: every term with literals has a role on both chips; the EPM7032's roles are
+unchanged. On the EPM7160E, term 0 is the XOR input (type 1) in 27 macrocells, term 1 is a plain
+sum term in 51 — consistent with the XOR-input hypothesis.
+
+## PLMQ7192-160 and the EPM7192EQC160 (2026-11-26)
+- Adapter ID 35. The vendor module's adapter check refused the EPM7192 while the 7128/7160
+  adapter (36) was fitted and accepted it after the swap. (A native read straight after the
+  swap once returned 0; repeated reads give 35.)
+- Through the vendor module: ID `ALTERA93`, 182 lines, 90159 fuses, 12.6 % programmed, 132 of 192
+  macrocells with logic.
+- Native: the same protocol shape a third time, on this adapter's lines (row clock 06.7, read
+  clock 0D.6, precharge on ports 0B/06/10/11/13/07/15/12/14 with pulses on 0E.2), with **two**
+  port reads per cell: port 0x0C is cell bits 0–7 and port 0x0D bits 0–3 are cell bits 8–11 —
+  the EPM7192E's cells are **12 bits** wide (device-file masks up to 0xFFF). My first decode kept
+  ten bits and differed in 8286 cells, all in bits 10–11. `max7000.line_read_ops_7192` matches
+  nine captured module reads op for op; set-up, supply release and drive table recorded from the
+  real unit. Native `apu read --part EPM7192EQC160`: all 182 lines **identical** to the
+  vendor-module image (8608 cells).
+- Whole-`chiptrip` synthesis with the exhaustive limit raised to 16 did not finish in 15
+  minutes; that design needs a symbolic method.
+
+## Symbolic synthesis (2026-11-26)
+- Exhaustive tabulation settles the whole design once per assignment (10 ms for `chiptrip`), so
+  a 14-signal function cost ~160 s, and 45 of `chiptrip`'s functions have more than 8 signals.
+  Now `apu.symbolic` evaluates the whole design once as BDDs (`apu.bdd`; 0.1 s, 881 nodes for
+  `chiptrip`). Functions whose true support is ≤ 12 signals are tabulated from their BDD and
+  minimised with Quine-McCluskey as before; wider ones get a Minato-Morreale irredundant cover.
+  The old path remains as a fallback when the symbolic evaluator meets an unsupported construct.
+- Flattening everything into two levels repeats shared conditions in every equation (the ticket
+  counter's toggle terms each carried the whole `get_ticket` condition). Synthesis now keeps
+  internal nodes as buried logic cells when that lowers the macrocell count (greedy, judged by
+  the fitter's own accounting with fast covers, then a pass dropping kept nodes that stopped
+  paying), removes registers no output depends on (half of the ticket counter's 74-series
+  counter), and drops clear/preset equations tied inactive.
+- Whole `chiptrip`: 38 macrocells → 25 of 32 in an EPM7032 (20 logic cells + 5 lent through
+  parallel expanders), about 6 s. The original compiler's fit file also targets an EPM7032 with 21
+  logic cells (`OH0R0`–`OH4R0` entries in its INTERNAL_INFO unexplained). The synthesised netlist
+  agrees with the design simulator over 600 random input changes on every output and register
+  (`tests/test_synth.py`; `synth.NetlistSimulator` simulates the equations themselves).
+
+## Front end: TRI variables, BIDIR and MACHINE ports on sub-designs (2026-11-26)
+- `x : TRI;` variables: `x.in` and `x.oe` are nodes; `pins = x[].out` becomes `TRI(x.in, x.oe)`
+  on each pin (reading `.out` inside logic is refused, since a MAX 7000 has no internal tri-state).
+- An instance's BIDIR port is the same wire as the parent signal it is connected to; the
+  connecting equation (in the parent's own statements only) is dropped and the port renamed.
+- `RETURNS (MACHINE s)` in prototypes was read as two ports, `MACHINE` and `s`; fixed. Machine
+  ports and `x : MACHINE;` alias declarations are joined by `a = b` equations into the real
+  machine. An alias reads as that machine, and the machine's state names are also defined
+  under the alias's own design prefix, so `ss_use` can test `ss_in == s2`. A top-level MACHINE
+  OUTPUT puts the state bits on pins `name2..name0`. A MACHINE INPUT connected to nothing is an
+  error, since its state names would be undefined.
+- Tutorial: 39 of 40 files now simulate, synthesise and fit (previously 33 simulated and 34
+  synthesised); `ss_use` alone is the exception above.
+
+## Fuse layout complete on the EPM7032; structural assembler (2026-11-26)
+- `apu/assemble.py` assigns every EPM7032 fuse to exactly one owner: 14080 product-term fuses
+  (32 macrocells × 5 terms × 88 columns), 144 routing-field fuses (72 two-fuse selects) and 448
+  option-element fuses. No overlaps and **no fuse left unexplained** (14672 of 14672).
+- `decode()` reads a fuse list into an assembly record (terms as literals over block inputs
+  and shared expanders, routing select values, option element values) and `encode()` writes
+  one back. The real EPM7032 read-back round-trips bit for bit (`tests/test_assemble.py`).
+- What remains for a programming file from a design is the semantic step, fitted netlist →
+  option values (XOR select, register/clock/clear sources, output enable). `asm.dll`'s cases
+  test design-database flag bits (`rdf_bits` 0x20, 0x300, 0x400, node+0x14c) that no vendor
+  file names; `tools/asm_cases.py` disassembles those cases with capstone (REA's Hopper session
+  was stuck). A vendor-compiled `.pof` of a known design would settle the meanings.
+- Searched the web for one (2026-11-26): `PabloArcade/max7000` decodes only the S/AE/B parts
+  and ships no samples. An Applefritter thread on an Apple IIe MMU has `retro_devices.zip` (MAX+PLUS
+  II project; whether it holds a `.pof` is unclear). Download awaiting the user's approval.
+
+## A vendor reference at last: MAX+PLUS II 10.2 in a Windows 2000 VM (2026-11-26)
+- The user installed MAX+PLUS II 10.2 Baseline in a UTM Windows 2000 VM from an ISO built here
+  (`vendor/maxplus2_10_2b.iso`: installers, `probes/`, and `tools/vmlink/agent.vbs`). UTM's
+  guest agent is not available for Windows 2000, so `tools/vmlink` is a small link instead: the
+  guest runs the VBScript agent, which polls `tools/vmlink/server.py` on 192.168.64.1 (UTM's
+  host side, token in every path) and runs queued commands, fetches and sends files. Lessons:
+  IE's XMLHTTP caches repeated GETs, so polls are POSTs with a unique query; `cmd /c a & b > f`
+  redirects only b, so commands are grouped in parentheses; the guest clock is 25 days behind
+  the Mac, so copied files must be re-stamped in the guest (`copy /b f+,, f`) or the compiler
+  refuses them as newer than its netlist.
+- `maxplus2.exe` has a command-line mode: `maxplus2 -c <project>` compiles (device and options
+  from `<project>.acf`), `-s` simulates (`-scf`, `-tbl`), `-ta_*` timing analysis, `-convert`.
+  The Baseline license lacks Waveform Design Entry and Design Doctor: chiptrip compiles once its
+  `speed_ch.wdf` is removed (the `.tdf` version is used) and DESIGN_DOCTOR is OFF.
+- Compiled: nine probes (`probes/`, one MAX 7000 feature each) and chiptrip, all for
+  EPM7032LC44; chiptrip with DEVICE = AUTO went to EPM7032LC44-6, as `apu.project` chooses.
+  Outputs are in `vendor/vm_link/inbox/` (not in the repo).
+- **POF format, settled**: MAX+PLUS II writes MAX 7000 fuses as one logical packet (tag 17),
+  start 0, count = the JEDEC fuse count (14672), eight fuses a byte, most significant bit
+  first, no inversion; no electrical packets. `pof.logical_fuses` / `fuses_to_logical_pof`
+  rebuild all ten vendor packets byte for byte; `apu pof2jed` now reads them.
+- **Literal polarity, corrected**: block input m's columns are 2m = complement, 2m + 1 = true
+  signal (p01: `a & b` uses the odd columns, the OR built as an inverted AND of complements the
+  even ones; p08: shared expanders `EXP(!i0 & !i10)` use the even columns). My earlier reading
+  of asm.dll had it reversed. Fixed in `fusemap` and `assemble`.
+- **Routing decode, withdrawn**: with known input pins the "binary, first fuse high" reading
+  names macrocell feedbacks for plain input pins. Reading first fuse low fits p01 (pins 4, 5, 6
+  → I/O entries 0, 29, 1, consistent across five probes) but on p08 gives one source to two
+  inputs of different product terms and none to another. So either the value encoding or the
+  architecture file's driver table is misread. The fixed facts to build from: field m (in
+  address order) belongs to PIA input m (the architecture file's GH entries list both), and in
+  p08 block-2 inputs 23, 16, 21 and 0 carry the pins of macrocells 1, 2, 3 and 12.
+- Also seen: in these vendor POFs unused macrocells alternate by parity (odd ones e31 = 3,
+  even ones e31 = 0 and e6 = 1), unlike the old chip image, so element meanings need care too.
+
+## EPM7032 fuse map settled against vendor POFs (2026-11-26)
+Two routing probes (`probes/r01_b1_to_b2`, `r02_b2_to_b1`: sixteen pinned inputs copied to
+sixteen pinned outputs in the other block, compiled in the VM) give 32 routing observations with
+no ambiguity. A search over field permutations and code assignments found exactly one model
+that fits all of them, and it also decodes `p01` and `p08` exactly as written:
+- **Routing**: block input m's two fuses sit at the m-th field address of its block; the value
+  is first fuse LOW bit; it is looked up in the source list the architecture file gives for
+  field **m XOR 3** of the same block (groups of four reversed). I/O entry i is the pin of
+  macrocell i + 1. Pins arrive with values 2 and 3; 0 and 1 (macrocell feedback in the file)
+  are assumed binary the same way, not yet seen with known sources.
+- **Per-pin fuses (element 34)** are in the same reversed groups of four: the file's row for
+  macrocell k belongs to macrocell ((k − 1) XOR 3) + 1. Values: 0 = output driver off (input
+  pin or unused), 3 = always driving, 1 = enabled by global OE1 (pin 44), 2 = by OE2 (pin 2). A
+  product-term enable (`TRI(a, a & b)`) is made by the compiler with a helper cell whose output
+  leaves on pin 2's partner and comes back on OE2: the EPM7032 has no product-term OE.
+- **Per-macrocell option fuses**: macrocells share 24-fuse rows in pairs, six nibbles N0..N5;
+  the odd macrocell's twelve fuses (in the file's element order 24 25 26 27 28 1 29 30 31 31 6
+  32) are N0 N1 N3, the even one's N5 N2 N4. With this, every unused and input-pin macrocell
+  reads the same, and identical used cells read the same at odd and even positions.
+- **Meanings so far** (from the probes): element 31 = 3 combinational, 2 registered, 0
+  unused; element 6 = 1 on outputs the compiler inverted; element 32 = 1 on the T flip-flop
+  (toggle feedback); 34 as above. Steering elements 24–28 and 1, 29, 30 still to read off.
+- Consequence: earlier listings of the user's own chip images had inverted literals, wrong
+  routing names and scrambled option values. `fusemap` and `assemble` now use this model;
+  `tests/test_vendor_pof.py` pins it to the vendor files.
+
+## EPM7032 option word decoded; fuse-level simulator; first generated programming files (2026-11-26)
+Steering probes `s01_steer` (sums of 1–5 terms, XORs, inverted AND, each at odd and even
+macrocells), `s02_regs` (inverted sums; registered sums of 1–5 terms; PT clock, PT clear, PT
+preset, clock enable, T flip-flop, global clear) and `s03_parallel` gave the twelve option fuses
+p0..p11 (assembler-file element order, at the real positions):
+- p7 p6 p5 p4 p3 = steering of terms 0 1 2 3 4 (0 = into the OR, 1 = special: term 0 =
+  this macrocell's shared expander, term 1 = XOR input, term 2 = clear, term 3 = clock enable
+  or (p2) clock, term 4 = preset; clear and preset active high).
+- p2 clock: 0 global, 1 term 3. p1: global clear pin also clears. p8 in use, p9 register
+  bypass, p11 T flip-flop. p0 and p10 each invert the XOR output.
+- XOR second input = complement of term 1 when term 1 is special, else 0. An empty term is
+  true where it drives a special input but adds nothing to the OR (p02: empty terms 2 and 4
+  steered into the OR of a D flip-flop). Unused clear/preset terms of registers are GND.
+- Shared expander k (column exp_wl[k]) comes from local macrocell ((k − 1) XOR 6) + 1 of the
+  block, its term 0 inverted (chiptrip's fourteen expanders and p08's two).
+- Dedicated OE pins are active low; the global clear pin is active low (so it implements
+  clrn = pin, not clrn = !pin: the fitter had that wrong and now uses a product-term clear).
+- Not yet seen: parallel expanders (the compiler used XOR reductions and shared expanders
+  instead), a dedicated input used as a logic input, the unused-pin driver setting.
+`apu.fusesim` simulates an EPM7032 from its fuses with this model. `tools/fusesim_check.py`
+co-simulates each vendor POF against its source in `apu.ahdl_eval`: **all fifteen vendor
+designs agree on every check** (37 000 checks, chiptrip included).
+`apu.generate` turns a synthesised, fitted netlist into fuses (matching block inputs to
+sources by bipartite matching, terms in slots 1 2 3 4 0 around clock/clear/preset slots) and
+`apu compile x.tdf` writes the POF (MAX+PLUS II's logical form) and optionally JEDEC.
+`tools/gen_check.py`: generated fuses for **44 designs** (probes and tutorial) behave like their
+sources in the fuse simulator. Refused for now: parallel expanders (auto_max, chiptrip,
+p08), tri-state outputs, a dedicated pin used as a logic input. Generated POFs differ from the
+vendor's for the same design and pins in 130–322 fuses (other block-input choices, the
+vendor's XOR-path encoding of single terms, unused pins), with the same behaviour.
+
+## Parallel expanders and dedicated inputs (2026-11-26)
+- Parallel expanders are off in the default synthesis style (`PARALLEL_EXPANDERS = OFF` in
+  DEFINE_LOGIC_SYNTHESIS_STYLE NORMAL.MAX7000). Probe `s04_parexp` turns them on: 5-input parity
+  at LC28 borrows from LC27. The lender's word is an ordinary combinational word with p0 = 1, the
+  borrower's is unchanged. So **p0 = lend this macrocell's OR to the next one up** (chains of
+  eight, a lender passing on what it borrowed), not an inversion: the single-term cells that
+  showed p0 = 1 were lending an empty OR, and their own XOR then sees 1 in its place, which
+  is why p0 looked like an inversion. Model and simulator updated; all vendor designs agree.
+- Dedicated inputs as logic inputs (probe `s05_dedicated`): the architecture file's dedicated
+  entries 0 1 2 3 (I/O entries 32–35) are pins 43, 44, 1, 2.
+- The generator now uses parallel expanders (lenders = the macrocells just below, within the
+  chain of 8; the pin assigner enforces the chain) and routes dedicated inputs. `tools/gen_check.py`:
+  49 designs generate and behave like their sources, chiptrip included (25 of 32 macrocells).
+  Refused: tri-state outputs (4 designs), ss_use (not a top-level design), and ahdlcnt, whose
+  35 block inputs pass the fitter's count but not the routing multiplexers (the fitter needs
+  to place for routability).
+
+## EPM7064S (MAX 7000S): Quartus as the reference, first fuse-map facts (2026-11-26)
+- The user has 25 EPM7064SLC44-10s. MAX+PLUS II in the VM refuses every MAX 7000S device
+  ("Illegal device name"): it runs unlicensed (`FULL_VERSION=OFF` in maxplus2.ini). Quartus II
+  13.0 SP1 Web Edition (free, last with MAX 7000S) is installed in vendor/quartus-13.0sp1 (5.5 GB,
+  MAX support only, user accepted the EULA) and runs in a 32-bit Debian container under
+  OrbStack. Its launcher refuses CPUs without "sse" in /proc/cpuinfo, and under emulation the
+  host's ARM cpuinfo shows through, so the container gets a cpuinfo describing the emulated
+  x86 (`vendor/quartus-13.0sp1/cpuinfo`). `tools/quartus_compile.py` converts a probe's
+  .tdf/.acf to a Quartus project (AHDL group bits are `din[0]` in Quartus, `din0` in MAX+PLUS
+  II) and runs quartus_map/fit/asm, then quartus_cpf to SVF and Jam.
+- POF: the same logical form as MAX+PLUS II's (tag 17), 30609 fuses, JEDEC order
+  (bit_jed_conv identity). Product terms: the same layout as the EPM7032 (five 88-column terms
+  per macrocell, 7040 fuses per block); region k is LC k (probe v01).
+- Routing: 1104 one-fuse connections (architecture file m7064s.maf: 64 macrocell and 68 I/O
+  entries, 132 global lines, 144 block inputs). Block input m (columns 2m, 2m + 1) takes its
+  line through a fuse listed for field **m XOR 3**, as on the EPM7032. Checked directly by
+  probe w01 (one pin into all four blocks): pin 4 → line entry 125 at field 14 (m = 13) in
+  every block; pin 26 → entry 168 at field 34 (m = 33). Each line reaches two fields per block.
+- The file's macrocell / I/O tags on lines do not match pins (pin 4's line is "driven by
+  macrocell entry 35"), so pin ↔ line must be taken from probes or decoded differently.
+  Probes whose outputs share logic (v01's AND chain) pull in macrocell feedbacks; use copies.
+  Open: t02 shows two programmed fuses of line 134 in block 2 (fields 18 and 23) for two
+  different pins (33, 36).
+- SVF from Quartus holds the full ISP algorithm (instructions 071, 01E, 012, 016, 01A, 03A,
+  022; a signature read expecting 5445414C). APU side: the chip (seating confirmed by the user)
+  never answers: the module's ISP path (pgd_setup(34, 1) sets the module's ISP flag 0x1003ba1c;
+  pgd_read_silicon_id then uses 0x10033300) clocks socket lines (port 08 bit 2, port 05 bits
+  5/0, TDO sampled on port 0C) but TDO stays 0; own bit-banging on those lines shows no port
+  bit changing; row reads with all 7 voltage variants return floating values.
+
+## EPM7064S over JTAG with a USB-Blaster (2026-11-26)
+- The user's USB-Blaster clone enumerates as 09fb:6001 (FTDI-based); openocd 0.12
+  (`interface/altera-usb-blaster.cfg`, libftdi; "unable to get latency timer" is harmless) drives it.
+  Its LED lights only when VCC(TRGT), header pin 4, sees target power. Chip in the PA44-48U
+  ZIF adapter on 5 V, wired TCK 32, TDO 38, TMS 13, TDI 7.
+- IDCODE 0x070640DD (Altera, part 7064, version 0); IR is 10 bits and captures 0x155.
+- Quartus's verify SVF (`quartus_cpf -c -q 1MHz -g 5.0 -n v x.pof verify.svf`) uses only
+  instructions 071 079 03E 01E 012 016 01A 03A 022 026; erase/program add 006 00A 00E 032 036.
+  `tools/jtag_svf_read.py` plays a verify SVF through openocd's Tcl port, refuses any other
+  instruction, and records every word read: a whole-chip dump in ~3 s.
+  Structure: 01E shifts a 253-bit row address (144 rows; the silicon-ID check reads 5445414C),
+  016 / 01A shift a 160-bit one-hot column phase (bit p of every 5), 03A reads, 022 / 026 shift
+  out 32 bits. Rows 0-88 hold product-term column (row XOR 6) of every term: with select 016 and
+  output 022, bit b is term 76 - 5b (b < 16) or 236 - 5b (b >= 16) plus the phase's offset
+  (phase 3 = term 1 of the macrocell; phases 0 and 2 are terms 2 and 4 in some order; 1 and 4
+  unseen yet); 01A / 026 give terms 160-319. Rows 89-143 hold option and routing fuses. All
+  read bits equal POF fuses uninverted (29 designs).
+- First read of a chip (re/traces/epm7064s_read1.json): every product-term and routing word
+  erased (FFFFFFFF); row 0 holds 52413937 / ff835631 / e7ffa301 (signature-row words Quartus
+  masks), and option rows 102 and 103 read 00000000 where row 99 (same fuses in every probe so
+  far) reads FFFFFFFF. Unexplained until a chip is erased and re-read.
+
+## EPM7064S routing: the architecture file's line lists are scrambled (2026-11-26)
+- 24 random probes (x00-x23: each output copies one input) give 432 observations; every literal
+  at block input m has exactly one programmed fuse in field m XOR 3, and no fuse is claimed by
+  two pins. But by m7064s.maf's line attribution several pins share lines and most pins use two
+  lines. The observations instead show each pin's line at the *same slot* (fuse within the
+  field's 8, at 28992 + 8 * (36 * (block - 1) + field) + slot) in the *same two fields* of
+  every block, e.g. pin 33: fields 23 and 26, slot 1; pin 36: field 18, slot 0. So each fuse
+  address is a real connection, but the file's grouping of addresses into lines does not
+  match Quartus's fuse numbering. The generator should use the observed (field, slot) table
+  per pin; macrocell feedback lines still need probes.
+
+## EPM7064S on the APU: pgm.dll uses the parallel algorithm, not JTAG (2026-11-26)
+- The module's JTAG pins per adapter come from a table at 0x1003aa60 (index = adapter ID at
+  0x1003b984; four u16 APU pin numbers TDI, TCK, TMS, TDO; port = 3 + pin / 8 below pin 40, else
+  6 + pin / 8; mask 1 << (pin & 7)), applied by 0x100063c0 only when the adapter ID matches.
+  Adapter 9 (PLMJ7000-44): APU pins 16, 43, 21, 48 = port 05 bit 0 (TDI, PLCC 7), 0B bit 3 (TCK,
+  PLCC 32), 05 bit 5 (TMS, PLCC 13), 0C bit 0 (TDO, PLCC 38). Checked on the unit: all three
+  outputs reach the socket at 3.3 V logic under the module's socket preamble, and a 1 kohm
+  link from pin 13 to pin 38 shows up on port 0C bit 0 in 236 of 236 samples
+  (tools/isp_hold.py, apu_loopback_watch.py). The module's own pgd_jtag_io drives TCK through a
+  port 08 strobe (07 / 03), not the pin, which is why driving it never moved pin 32.
+- But pgm.dll never sets the "ISP" flag (pgd_setup(34, 1)) for a socketed part. Hosted
+  check_silicon_id for EPM7064SLC44-10 (type 0x42) tries the part file's three variants
+  (VCC 2500, 3300, 5000; ID voltages 2500/2000/11250, 3300/2000/12000, 5000/2000/10000) with
+  pgd_read_silicon_id(1 | 1 | 0, i, ...). Without the ISP flag the module's ID read is a
+  parallel one: drive enables 03=FF 04=FF 05=DF 06=2F 07=2F 0B=F7 0C=07 (PLCC 13 and 32 become
+  inputs), data read from ports 05, 06, 0B, 0C (80 reads each); compare the EPM7032 (type 0x0a):
+  enables 05=FF 06=71 07=A5 0B=FF 0C=0F, data from port 07 only.
+- CORRECTION: the hosted check_silicon_id run on the unit (all zeros, message 0x5308000f) was
+  taken with the socket EMPTY (the chip had been removed for measuring), so it says nothing
+  about the chip. Only the direct JTAG attempts (tools/apu_jtag_id.py, apu_jtag_variants.py:
+  with and without the ID voltages, 3.3 / 5 V levels, slow TCK; all 0) ran with the chip in,
+  and pgm.dll does not use JTAG for a socketed part. pgm.dll's own sequence on the chip: pending.
+- With the chip in (two EPM7064SLC44-10s): pgm.dll's hosted check, variant 0 (5 V; the part
+  file's block 0 lists ALTERA96 and ALTERA97 IDs, block 1 ALTERA98 = EPM7064AE at 3.3 V, block 2
+  ALTERA00 = EPM7064B at 2.5 V) reads `41 4C 54 45` ("ALTE") then FF FF 00 00 / FF FF FF FF, and
+  byte 9 = 01; the JTAG read of the same chip shows "ALTERA97" (row 0 words 5445414C, 52413937).
+  Variants 1 and 2 use the FPGA's JTAG engine instead (ports 03 / 08, enables 14-1A = FF,
+  03 = FE) and read zeros, as expected for 5 V silicon.
+- The module's 4-bit cell for type 0x42 (0x10016039): reads ports 05 06 0B 0C; bit 0 = 06 bit 4,
+  bit 1 = 05 bit 5 (PLCC 13), bit 2 = 0B bit 3 (PLCC 32), bit 3 = 0C bit 3 (PLCC 41; found by
+  driving it on the empty socket). ID bytes 0-3 come from cell bits 0-1, bytes 4-7 from bits
+  2-3. With a chip in, bits 2 and 3 never change within a read on either chip, while bits 0-1
+  carry the row's data (also e.g. A301 seen in the JTAG dump). Loop-back on the empty socket
+  under the module's enables (0B = F7, 0C = 07): PLCC 41 seen on 0C bit 3 in 118 / 118 samples;
+  PLCC 32 on 0B bit 3 in 96 / 157 (hand-held contact unsure), retest pending.
+- Loop-back retest: PLCC 32 seen on 0B bit 3 in 118 / 118 samples. Supply in pgm.dll's pre-read
+  state (select, program_setup 0 and 1), socket empty: VCC pins 3, 15, 23, 35 and grounds 10, 22,
+  30, 42 all good (user's meter); no 10 V on any contact while held (ADC ch 7 = 92, about 10 V on
+  the VPD rail, so it is switched to a pin only inside the read). So with the APU's inputs, the
+  contacts and the supply verified, two EPM7064SLC44-10s drive cell bits 0-1 but not bits 2-3
+  (PLCC 32, 41) under the module's variant-0 read. Cause not found.
+
+## EPM7064S routing table complete enough for generation; option-fuse layout (2026-11-26)
+- Macrocell feedback lines from 36 register probes (y00-y35) and 6 shift-register probes (z00-z05:
+  60 DFFs, each fed by one other): 505 observations, all 64 macrocells. Like pins, each source
+  sits at fixed (field, slot) places, the same in every block; a macrocell line's two fields may
+  use different slots (LC36: field 9 slot 7 and field 14 slot 6). No place is claimed twice.
+  `apu/epm7064s.py` holds the table (64 macrocells, 32 pins: the 28 user I/O and 4 dedicated
+  inputs; 166 places); tests/test_epm7064s.py.
+- m7064s.maf does not describe Quartus's numbering: Quartus uses slot 7 in fields where the file
+  lists only slots 0-6. Of 264 slots per block, 146 + 20 are explained; the rest belong to the 32
+  I/O cells with no pin on the 44-pin package (64 slots) and to second fields of 26 sources seen
+  once so far (10 pins, 16 macrocells).
+- Option fuses (28160-28991, 13 per macrocell in the architecture file's order: elements 24 25
+  26 27 28 1 29 30 31 31 6 32 81) sit physically in JTAG rows 89-101 (one row per option bit), in
+  each macrocell's own column (the product-term column rule: select 016 / output 022 bit b is
+  macrocell 16 - b for b < 16). The POF order permutes them in groups of eight macrocells
+  (unused pairs repeat with period 4). Only rows 91, 94, 98, 99 vary across the 72 probes so
+  far; option probes (T, product-term clock, clear, preset, invert, expanders, slew, open drain)
+  are needed to decode the rest.
+
+## EPM7064S fuse model: options, output enables, T bits, empty terms; co-simulated (2026-11-27)
+- Option fuses (apu/epm7064s.py OPTION_ROLES): single-feature probes (f01a..f20m: one node at a
+  chosen macrocell via a Quartus location assignment, one feature per variant: comb, !a, DFF,
+  TFF, product-term clock, global clear, product-term clear and preset, DFFE, 5 and 8 terms,
+  XOR, !d) show the POF permutes each group of eight macrocells' 104 option fuses the same way
+  in every group. Each macrocell has 13 roles: steering t0..t4 (EPM7032 p7..p3), clk (p2),
+  gclr (p1), nused (NOT p8), byp (p9), inv (p10), T, T2, and gck (0 only with a product-term
+  clock). In POF order each macrocell's roles run in one cyclic order (T T2 gclr clk t4 t3 t2 t1
+  t0 gck nused byp inv) split into runs interleaved with neighbours; the eight positions tile
+  the 104 offsets exactly. Positions 1 and 6 have no pins, so their combinational roles come
+  from that order (Quartus flattens LCELL / MCELL / shared nodes into the output cell, so
+  combinational nodes cannot be placed in buried macrocells). Unused cells all carry the
+  EPM7032's unused word (1820 of them in 40 random designs).
+- Clear, preset, clock enable and D-input / output inversion of single literals change no option
+  fuse: they live in the product terms (as on the EPM7032).
+- Output enables (PIN_OE): two fuses per pin, both 1 exactly when the pin drives (316 designs).
+  The OE1 / OE2 and product-term enable modes are not decoded.
+- T bits: T or T2 alone = T flip-flop toggled by the logic; both = toggles on every enabled
+  clock (logic input reads 1); T2 alone in an unclocked cell (clk = 1, gck = 1) = parallel
+  expander lend (EPM7032 p0). Established by co-simulation: the readings "T2 = toggle" and
+  "T2 = lend" each fail on cells the combined rule gets right.
+- An empty product term steered into the OR is TRUE on this chip as Quartus programs it (it uses
+  that for constant-1 data inputs and fills unused OR slots with all-connected terms); the
+  EPM7032 model (MAX+PLUS II POFs) keeps "adds nothing". apu.fusesim reads
+  `empty_term_in_or_is_true` from the fuse map.
+- Routing additions found by co-simulation: pins 16 (16,1), 17 (24,2), 34 (24,1), 36 (24,0),
+  37 (35,1), 21 (27,3) and LC39 (7,6). Pin 21's two places use different slots (29,2 / 27,3).
+  An output pin's line carries its driven value (Quartus uses it for register feedback).
+- Result (tools/fusesim_check.cosim with epm7064s.FuseMap, 106 designs, 1.1 M pin checks): every
+  combinational output matches (314 / 314 in the random option designs, all routing probes);
+  all registers match except those with an inverted output, where Quartus pushes the
+  inversion into the register: they differ until first loaded (power-up; starting the source's
+  register at 1 makes T flip-flops match too) and, with both clear and preset, when both are
+  asserted (the push-back swaps their priority). tests/test_epm7064s.py co-simulates probes.
+- Still open: shared-expander sources (the EPM7032 formula is assumed; 4 cells in the random
+  designs used expanders and matched), OE modes, the global fuses after 30582.
+
+## EPM7064S programming data generated natively (2026-11-27)
+- apu/generate7064s.py builds EPM7064SLC44 fuses from a fitted netlist (the EPM7032 generator's
+  construction on the apu.epm7064s tables); `apu compile --device EPM7064SLC44` uses it. The
+  fitter (project.fit_part) now takes "s" parts, removes the JTAG pins (7, 13, 32, 38) from the
+  pin table, and packs with a per-block pin capacity (apu.fit.fit pin_slots: only 7 of each
+  block's 16 macrocells have a usable pin); the placer puts output-driving cells on pinned
+  macrocells and buried cells on pinless ones.
+- tools/gen_check7064s.py: 23 of the 24 probes in probes/ generate (p07_tri refused: tri-state)
+  and co-simulate with 0 mismatches (r01/r02/t01/t02 cross-block routing, s03/s04 parallel
+  expanders, s02 all register kinds, s05 dedicated inputs).
+- Remaining fuses (30144-30608): PIN_UNUSED (one fuse per pin, 1 exactly when the design does
+  not use it, 321 designs), GLOBAL_CLOCK_UNUSED = 30576, and 380 constant fuses (12 zeros).
+- Quartus's quartus_cpf converts a generated POF (t02) to a verify SVF with 0 errors and 0
+  warnings. Not yet programmed into a chip.
+
+## EPM7064S SVF (JTAG ISP) written natively (2026-11-27)
+- 30 index-coded POFs (fuse f = bit j of f, and complements) converted by quartus_cpf to program
+  and verify SVFs map every SVF data bit to its fuse: 30608 fuses one-to-one (fuse 30608 is never
+  used), structure identical whatever the POF.
+- apu/svf7064s.py writes both files: ID check (header row; expects 5445414C), bulk erase (all
+  rows; 006 00E 00A, 100 ms), 143 rows programmed in order (01E address, 012, 016 and 01A data,
+  006 00A 30 ms, DRPAUSE status bit), then verify: product-term rows read phases 4-0 of both
+  halves, the other rows phase 4; after programming each read twice (036 and 032, the margins),
+  a plain verify once (03A). A read of phase p returns data bit 5j + p as bit j. Product-term
+  rows k = 1-88: address bits 107 - k, 252 - k; 016 bit b = term 79 - b (b < 80) or 239 - b,
+  01A bit b = term 319 - b; column (k - 1) XOR 7. The other 55 rows' layout is
+  apu/data/epm7064s_isp.json. Bit 14 of the 01A half is masked in rows 134 and 139-143.
+- Row 128, 01A bit 64 does not come from the fuses: quartus_cpf sets it 1 for every Quartus
+  design (default: JTAG enabled) and 0 for a POF without Quartus's option packets (tags 3 and
+  5). Taken as JTAG enable; svf7064s writes 1 unless jtag_enabled=False. Consequence: converting
+  one of our own POFs with quartus_cpf would have cleared it.
+- Our output is statement-for-statement identical (MASK carry-over resolved) to quartus_cpf's
+  for Quartus designs t02, x00, o05, z00, w01, y20, f03d (program and verify), and for the
+  synthetic POFs apart from that bit. tests/test_svf7064s.py. `apu compile --svf x.svf` writes it.
+
+## EPM7064S output enables: three bits per pin, six global OE lines (2026-11-27, partial)
+- Tri-state probes e00-e11 (TRI outputs enabled by pin 44, pin 2, a product term, its complement,
+  an ordinary input pin, or always): each pin's enable is a 3-bit selector (PIN_UNUSED[pin] + 1,
+  PIN_OE[pin], PIN_OE[pin] + 1). Always = 1 1 1 (24 / 24), OE1 pin 44 = 1 0 1 (21 / 21), OE2 pin 2
+  = 0 0 0 (23 / 23); a pin that does not drive (input or unused) = 1 0 0 in all earlier designs
+  (the third bit never varied there). Product-term and input-pin enables use the other codes,
+  selecting the other global OE lines (the MAX 7000S has six, fed from I/O pins or macrocells).
+- The lines' sources: about 20 fuses in 30148-30194 (architecture-file element 67's area) vary
+  with which enables a design uses; all 1 in designs without tri-state. Not decoded yet. Until it
+  is, the generators refuse tri-state outputs.
+- Dedicated OE pins decoded (probes q00-q04): global OE line 1 = selector 1 0 1, fed by pin 44
+  when fuse 30148 = 0; line 2 = selector 0 0 0, fed by pin 2 when fuse 30161 = 0; the lines are
+  active low (enable while the pin is low) unless their invert fuse (30159 / 30173) is 0. One
+  pin used in both polarities (q04) takes further lines (selectors 0 0 1, 0 1 0, 0 1 1; source
+  fuses 30164-30194), not decoded. apu.fusesim reads the polarity through
+  FuseMap.oe_active_high; q00-q03 drive exactly when their sources enable.
+- generate7064s now writes tri-state outputs enabled by an input on pin 44 or 2 (either
+  polarity, one per pin); project.fit_part puts such enable inputs on the OE pins when the .acf
+  does not. Product-term enables are still refused.
+- apu/jtag.py + `apu jtag id|read|verify|program`: the EPM7064S on a USB-Blaster through openocd.
+  read captures the verify sequence's words and maps them back to fuses (svf7064s.ROWS; read
+  bit j of phase p = data bit 5j + p), writing a POF or JEDEC; verify compares; program writes
+  the SVF and plays it with openocd's own `svf` command, then verifies independently, and only
+  runs with --yes. tests/test_jtag.py checks decode(verify words of random fuses) = fuses
+  offline. Not yet run on a chip.
+- All six global OE lines decoded (epm7064s.OE_LINES): selector code -> invert fuse and source
+  fuses. 101: pin 44 (30148), invert 30159; 000: pin 2 (30161), LC4 30162, LC24 30163, LC40 30164,
+  invert 30173; 001: LC5 30169, LC19 30170, LC35 30171, LC53 30172, invert 30180; 010: LC17
+  30176, LC20 30177, LC33 30178, invert 30187; 011: LC62 30184, LC41 30185, LC25 30186, invert
+  30194; 110: LC1 30154, LC3 30155, LC49 30157, LC51 30158, invert 30166. A line enables while
+  its source is low unless its invert fuse is 0. Product-term (and inverted-pin) enables are a
+  macrocell computing the enable that drives a line (Quartus copies an OE pin into a macrocell
+  when both polarities are needed). Unfilled fuses (30149-30153, 30156, 30165, 30179, ...) are
+  presumably further sources. epm7064s.FuseMap.output_enabled decides fusesim's drives; the 17
+  tri-state designs (e00-e11, q00-q04) co-simulate with 0 mismatches (48890 checks) and every
+  enable matches its source (7296 checks).
+- Next for the generator: product-term enables need the fitter to reserve a source macrocell of
+  a free line for the enable cell. Not done; the generators still refuse them.
+- generate7064s now handles any output enable of up to five product terms: OE-pin enables drive
+  lines 101 / 000 directly; every other distinct enable gets a free macrocell from a free line's
+  source list (OE_LINES), computing it, with the line set direct. All 18 tri-state designs
+  (p07_tri, q00-q04, e00-e11) generate, co-simulate with 0 mismatches and drive exactly when
+  their sources enable (6448 checks).
+
+## Tutorial designs on the EPM7064S (2026-11-27)
+- 37 of the 40 tutorial files compile for the EPM7064SLC44 and co-simulate with 0 mismatches
+  (chiptrip .tdf and .gdf: 25 of 64 macrocells, 7800 checks each); not generated: ahdlcnt (more
+  pins than the 28 user I/O + 4 inputs left with JTAG on), keyboard (a preset that is not one
+  product term), ss_use (compiles only inside another design).
+- Fixes on the way, both generators: a bidirectional pin's outside value (`x@ext`) reads the
+  pin's own line; the placer puts the longest expander chains first; project.fit_part refits
+  with a lower capacity for a block whose chains find no runs of free macrocells, and
+  generate7064s.compile_netlist refits for a block whose inputs cannot all be routed (each
+  source reaches a block at one or two fixed places). `apu compile`, the GUI and
+  tools/gen_check7064s.py use compile_netlist.
+- synth.hoist_controls (called by project.fit_part): a register clock, clear or preset that is
+  not one product term is computed in a node of its own (one macrocell, shared by registers with
+  the same control) and read as a single literal. keyboard (preset = complement of a 4-term sum
+  on 8 registers) now compiles for the EPM7064S (4800 checks, 0 mismatches); on the EPM7032 it is
+  refused for its product-term output enables, which that chip does not have. 38 of 40 tutorial
+  files now compile for the EPM7064S.
+
+## EPM7128S (84-pin): first findings; routing is two-level (2026-11-27, in progress)
+- Quartus II 13.0 compiles for EPM7128SLC84-15; the POF has 62703 fuses: 128 macrocells x 440
+  product-term fuses, option fuses from 56320 (13 per macrocell), routing from 57984 (8 regions
+  of 504), pin / global fuses from 62016. JTAG pins 14 (TDI), 23 (TMS), 62 (TCK), 71 (TDO);
+  dedicated 83 (GCLK1), 1 (GCLRn), 84 (OE1), 2 (OE2).
+- tools/s7k_probes.py (probe generators per device) and tools/s7k_derive.py (table derivation);
+  apu/s7k.py holds table-described MAX 7000S devices (Tables, FuseMap) and apu.generate7064s
+  now takes a device's tables. apu.fusesim takes the package's dedicated pins from the fuse map.
+- Option fuses follow the EPM7064S layout: 7666 of 7680 macrocells in 60 designs read as
+  predicted (unused word / used bit). Each pin has an output-enable fuse pair as on the
+  EPM7064S (e.g. pin 4: 62160, 62161); global-clock-unused fuse 62674.
+- Routing differs from the EPM7064S. One-literal probes (u7128s_*): an output in blocks 1-4
+  programs ONE fuse in its own region; an output in blocks 5-8 programs TWO: the source's tap in
+  the PARTNER region (block b pairs with 9 - b) and one selector fuse in its own region. A
+  source's tap offset within a region is the same in regions 1-4 (pin 77: offset 18 in each).
+  The taps of a block input are not the uniform 14-fuse fields of the architecture file
+  (whose line lists are again not Quartus's numbering): for blocks 1-4 they form contiguous
+  groups in the order g = m XOR 3 with widths of about 16 and 12 alternating (e.g. input 10:
+  offsets 128-143; input 9: 148; input 3: 0-15). Selector fuses seen for right-hand block
+  input m: offset 14 * (m + 3) + 6 (m = 0 mod 4), 14 * (m + 2) + 4 (1 mod 4), 14 * m (2 mod 4),
+  14 * (m - 3) + 10 (3 mod 4): one per input. Which partner taps a right-hand input can use is
+  not established. Systematic per-pin probes (v7128s_*) are compiling to settle the groups.
+
+## EPM7128S (84-pin): routing solved; programming data generated natively (2026-11-27)
+(Supersedes the guesses about tap groups in the previous section.)
+- Structure, as the architecture file m7128s.maf describes it (its PIA_INPUT / PIA entries are
+  right; only the fuse order inside a block's region differs in Quartus's numbering): every block
+  has 36 input muxes of 13 taps; block input i (product-term columns 2m, 2m + 1, i = m XOR 3)
+  reads its own mux i or, when its selector fuse is programmed (0), one fixed mux of the partner
+  block (block b pairs with 9 - b). The pairing differs by direction: PARTNER_RIGHT (a block 5-8
+  input <- a block 1-4 mux) and PARTNER_LEFT, both read from the file's PIA_INPUT targets; all
+  27 pairings measured with per-pin probes agree with it.
+- Quartus's order: a block's 504 routing fuses are nine periods of 56, a period holding inputs
+  4P .. 4P + 3. apu.s7k.PERIOD gives each position: field 0 taps at 0-7, 11-15; field 1 at 8, 9,
+  16-23, 29-31; field 2 at 24-27, 32-39, 47; field 3 at 40-45, 49-55; selectors at 10, 28, 46,
+  48 (fields 0-3). Solved by constraint intersection: with it, all 2208 (design, block) tap sets
+  of 276 designs equal exactly the muxes their literals need, with no violations.
+- Taps: a source's tap offsets are the same in every block. From literals with a certain source
+  (pin-copy probes x / u / v: one input pin into one output per block; shift registers z): 220
+  taps, every one of the 64 pins and 128 macrocells at least once, no conflicts over 2241
+  literals; 31 more pin taps inferred from the random-logic probes (an unknown tap read by an
+  output's macrocell must carry a pin of that output's equations). 251 of 468 taps known.
+- Options: the EPM7064S layout (7666 of 7680 macrocells as predicted). Pins: 60 output-enable
+  pairs and unused fuses, global-clock-unused 62674. OE lines: six codes with invert and source
+  fuses derived from 16 tri-state probes (some sources unresolved).
+- Co-simulation of Quartus designs (tools/s7k_cosim.py): routing probes 30 / 30 exact (579600
+  checks); random-logic and tri-state probes 801671 checks with 2685 mismatches in 16 of 46
+  designs (taps seen once and not yet named; one tap, offset 369, with no candidate).
+- Generation: apu.s7k.Tables.route places each block's signals on its own muxes or, through
+  selectors, on the partner's; apu.generate7064s takes the tables. `apu compile --device
+  EPM7128SLC84` writes a POF / JEDEC. All 23 probe designs and 39 of the 40 tutorial files
+  (chiptrip in 25 of 128 macrocells, ahdlcnt, keyboard) generate and co-simulate with 0
+  mismatches; quartus_cpf accepts a generated POF. tests/test_s7k.py. Not done for this device:
+  the SVF writer (needs the index-coded POF conversions), the remaining taps, a chip.
+- Tools: tools/s7k_probes.py (x, z, o, e probe generators per device), tools/s7k_derive.py
+  (tables -> apu/data/<tag>.json), tools/s7k_cosim.py.
+
+## EPM7128S SVF and JTAG commands (2026-11-27)
+- tools/s7k_svf_template.py converts 32 index-coded POFs with quartus_cpf and traces every data
+  bit of its program (17746 statements) and verify (9152) files to a fuse: 62702 of 62703 fuses
+  carried (62696 is not), stored run-length coded in apu/data/7128s_isp.json.gz (78 kB).
+  apu/svf_template.py writes the files from it. Bits Quartus sets only for its own designs
+  (program statement 2664 TDI bit 144, and the verify reads of it) are taken as JTAG enable and
+  written 1 by default, found automatically by comparing with a Quartus design's own SVF.
+- Checked: on the EPM7064S the template method gives the same statements as quartus_cpf and as
+  the hand-modelled apu/svf7064s.py; on the EPM7128S program and verify files equal quartus_cpf's
+  for o7128s_05, z7128s_00 and e7128s_03.
+- `apu compile --svf` covers the EPM7128S; `apu jtag --device EPM7128S id | read | verify |
+  program` use the template (reads are decoded by its TDO bit map; round trip tested offline).
+  The EPM7128S IDCODE 0x071280DD is assumed from the EPM7064S pattern, not read from a chip.

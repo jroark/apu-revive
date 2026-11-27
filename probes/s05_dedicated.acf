@@ -1,0 +1,13 @@
+CHIP s05_dedicated
+BEGIN
+	DEVICE = EPM7032LC44-15;
+	|g43 : INPUT_PIN = 43;
+	|g1 : INPUT_PIN = 1;
+	|g44 : INPUT_PIN = 44;
+	|g2 : INPUT_PIN = 2;
+	|a : INPUT_PIN = 4;
+	|y43 : OUTPUT_PIN = 41;
+	|y1 : OUTPUT_PIN = 40;
+	|y44 : OUTPUT_PIN = 39;
+	|y2 : OUTPUT_PIN = 38;
+END;

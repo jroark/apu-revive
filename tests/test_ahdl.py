@@ -314,3 +314,70 @@ class Simulate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Hierarchy(unittest.TestCase):
+    LIB = {
+        "busreg": "SUBDESIGN busreg ( clk, oe : INPUT; io : BIDIR; ) BEGIN io = TRI(DFF(io, clk, , ), oe); END;",
+        "counter3": """SUBDESIGN counter3 ( clk, reset, go : INPUT; s : MACHINE OUTPUT; )
+                       VARIABLE m : MACHINE WITH STATES (a, b, c);
+                       BEGIN s = m; m.(clk, reset) = (clk, reset);
+                       CASE m IS WHEN a => IF go THEN m = b; END IF;
+                                 WHEN b => IF go THEN m = c; END IF;
+                                 WHEN c => IF go THEN m = a; END IF; END CASE; END;""",
+        "is_c": "SUBDESIGN is_c ( s : MACHINE INPUT; y : OUTPUT; ) BEGIN y = (s == c); END;",
+    }
+
+    def resolve(self, name):
+        return self.LIB.get(name.lower())
+
+    def test_bidir_port_of_an_instance_is_the_pin(self):
+        from apu import ahdl_eval
+        text = """FUNCTION busreg (clk, oe) RETURNS (io);
+                  SUBDESIGN top ( clk, oe : INPUT; p : BIDIR; ) BEGIN p = busreg(clk, oe); END;"""
+        sim = ahdl_eval.Simulator(text, self.resolve)
+        sim.set(oe=0, p=1)
+        sim.set(clk=1)
+        sim.set(clk=0, p=0)
+        self.assertEqual(sim.env["p"], 0)                  # not driving: the outside value
+        sim.set(oe=1)
+        self.assertEqual(sim.env["p"], 1)                  # driving back what it captured
+
+    def test_tri_variable_drives_pins(self):
+        from apu import ahdl_eval, synth
+        text = """SUBDESIGN t ( a[1..0], e[1..0] : INPUT; y[1..0] : OUTPUT; )
+                  VARIABLE b[1..0] : TRI;
+                  BEGIN b[].in = a[]; b[].oe = e[]; y[] = b[].out; END;"""
+        d = ahdl_eval.Design(text)
+        self.assertEqual(d.tri, {"y1", "y0"})
+        net = synth.synthesise(text)
+        self.assertEqual(net.outputs["y1"].text(), "a1")
+        self.assertEqual(net.enables["y0"].text(), "e0")
+
+    def test_machine_passed_between_designs(self):
+        from apu import ahdl_eval
+        text = """FUNCTION counter3 (clk, reset, go) RETURNS (MACHINE s);
+                  FUNCTION is_c (MACHINE s) RETURNS (y);
+                  SUBDESIGN top ( clk, reset, go : INPUT; y : OUTPUT; )
+                  VARIABLE m : MACHINE;
+                  BEGIN m = counter3(clk, reset, go); y = is_c(m); END;"""
+        sim = ahdl_eval.Simulator(text, self.resolve)
+        seen = []
+        sim.set(go=1)
+        for _ in range(4):
+            sim.set(clk=1)
+            sim.set(clk=0)
+            seen.append(sim.env["y"])
+        self.assertEqual(seen, [0, 1, 0, 0])               # a -> b -> c -> a -> b
+
+    def test_machine_input_alone_is_explained(self):
+        from apu import ahdl_eval
+        with self.assertRaisesRegex(ahdl_eval.Unsupported, "connected to no state machine"):
+            ahdl_eval.Design(self.LIB["is_c"])
+
+    def test_machine_output_at_the_top_is_its_state_bits(self):
+        from apu import ahdl_eval
+        sim = ahdl_eval.Simulator(self.LIB["counter3"])
+        sim.set(go=1)
+        sim.set(clk=1)
+        self.assertEqual([sim.env[p] for p in sim.design.groups["s"]], [0, 1])   # state b = 1

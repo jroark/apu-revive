@@ -180,7 +180,7 @@ class FuseMapTest(unittest.TestCase):
         self.assertEqual(fmap.option_bits(fuses, 2)[24], 1)
         rest = fmap.other_fuses()
         self.assertEqual((rest[0], rest[-1], len(rest)), (14464, 14607, 144))
-        self.assertIn("]: !in3 & exp1", fmap.report(fuses))
+        self.assertIn("]: in3 & exp1", fmap.report(fuses))              # column 7 = 2·3 + 1: the true signal
         # term 3: element 27 = 1 means the sum; 0 means type 2 or 5, and element 1 picks which
         self.assertEqual(fmap.term_roles(fuses, 1)[3], [0])
         fuses[14080 + 3] = 0
@@ -225,6 +225,26 @@ class LineRead160(unittest.TestCase):
         reads[9 * 7:9 * 8] = bytes([0x10, 0x01, 0x04, 0x48, 0x04, 0x02, 0x40, 0x04, 0x01])   # all ten bits
         cells = max7000.cells_from_reads_160(bytes(reads))
         self.assertEqual([(i, v) for i, v in enumerate(cells) if v], [(40, 0x3FF)])
+
+
+class LineRead7192(unittest.TestCase):
+    # (row, cells, first read?, sha256 prefix) of the vendor module's traffic for nine line reads
+    # of an EPM7192EQC160 in simulation, delays included; row 0 is the signature row
+    REFERENCE = [(0, 80, True, 'ccda847bf3811d52'), (1, 80, False, '3839b605b2ef2c77'), (5, 80, False, '8dbfda6935f3240a'), (88, 80, False, '91b8bef39e6b7377'), (89, 16, False, '7a53991aa2bcb009'), (128, 80, False, 'ee089d812b9a83e5'), (129, 16, False, '5fe5289b60b33810'), (181, 16, False, 'e5242b85a8b0766a'), (1, 80, False, '3839b605b2ef2c77')]
+
+    def test_reads_match_the_module(self):
+        import hashlib
+        from apu import max7000
+        for row, n, first, digest in self.REFERENCE:
+            ops = max7000.line_read_ops_7192(row, first, n, signature=(row == 0))
+            self.assertEqual(hashlib.sha256(repr(ops).encode()).hexdigest()[:16], digest, (row, n))
+
+    def test_twelve_bit_cells(self):
+        from apu import max7000
+        reads = bytearray(2 * 80)
+        reads[14], reads[15] = 0xA5, 0xFC                    # clock 7: low byte A5, high nibble C
+        cells = max7000.cells_from_reads_7192(bytes(reads))
+        self.assertEqual([(i, v) for i, v in enumerate(cells) if v], [(40, 0xCA5)])
 
 
 class LineWrite(unittest.TestCase):

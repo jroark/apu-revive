@@ -1,0 +1,7 @@
+% routing probe: din[k] on the pin of macrocell k+1, dout[k] on macrocell k+17 %
+SUBDESIGN r01_b1_to_b2
+( din[15..0] : INPUT;
+  dout[15..0] : OUTPUT; )
+BEGIN
+	dout[] = din[];
+END;

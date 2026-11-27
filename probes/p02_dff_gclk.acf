@@ -1,0 +1,4 @@
+CHIP p02_dff_gclk
+BEGIN
+	DEVICE = EPM7032LC44-15;
+END;

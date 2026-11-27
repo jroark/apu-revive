@@ -1,0 +1,25 @@
+SUBDESIGN s02_regs
+( clk, gclr, a[4..0], b[4..0] : INPUT;
+  n1, n2, n3, n4, n5, r1, r2, r3, r4, r5, rpc, rcl, rpr, ren, rt, rgc : OUTPUT; )
+VARIABLE
+	fr1, fr2, fr3, fr4, fr5, fpc, fcl, fpr, fgc : DFF;
+	fen : DFFE;
+	ft : TFF;
+BEGIN
+	n1 = !((a0 & b0));
+	n2 = !((a0 & b0) # (a1 & b1));
+	n3 = !((a0 & b0) # (a1 & b1) # (a2 & b2));
+	n4 = !((a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3));
+	n5 = !((a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3) # (a4 & b4));
+	fr1.clk = clk; fr1.d = (a0 & b0); r1 = fr1;
+	fr2.clk = clk; fr2.d = (a0 & b0) # (a1 & b1); r2 = fr2;
+	fr3.clk = clk; fr3.d = (a0 & b0) # (a1 & b1) # (a2 & b2); r3 = fr3;
+	fr4.clk = clk; fr4.d = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3); r4 = fr4;
+	fr5.clk = clk; fr5.d = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3) # (a4 & b4); r5 = fr5;
+	fpc.clk = a4 & b4; fpc.d = (a0 & b0) # (a1 & b1); rpc = fpc;
+	fcl.clk = clk; fcl.d = (a0 & b0) # (a1 & b1); fcl.clrn = !(a4 & b4); rcl = fcl;
+	fpr.clk = clk; fpr.d = (a0 & b0) # (a1 & b1); fpr.prn = !(a4 & b4); rpr = fpr;
+	fen.clk = clk; fen.d = (a0 & b0) # (a1 & b1); fen.ena = a4 & b4; ren = fen;
+	ft.clk = clk; ft.t = (a0 & b0) # (a1 & b1); rt = ft;
+	fgc.clk = clk; fgc.d = (a0 & b0) # (a1 & b1); fgc.clrn = gclr; rgc = fgc;
+END;

@@ -43,7 +43,9 @@ def flatten(tree, resolver=None, prefix="", counter=None):
     counter = counter if counter is not None else [0]
     _, _, constants, includes, protos, sub = tree
     _, _, ports, variables, statements = sub
-    protos = {name: (ins, outs) for name, ins, outs in protos}
+    def no_keyword(entries):                              # RETURNS (MACHINE ss_out): one port
+        return [e for e in entries if not (e[0] == "name" and e[1].upper() == "MACHINE" and e[2] is None)]
+    protos = {name: (no_keyword(ins), no_keyword(outs)) for name, ins, outs in protos}
 
     def generate_condition(node):
         """Value of an IF ... GENERATE condition. The target is a MAX 7000 device, so the
@@ -85,7 +87,7 @@ def flatten(tree, resolver=None, prefix="", counter=None):
         if text:
             try:
                 for name, ins, outs in ahdl.parse_prototypes(text):
-                    protos.setdefault(name, (ins, outs))
+                    protos.setdefault(name, (no_keyword(ins), no_keyword(outs)))
             except ahdl.AhdlError:
                 pass
     instances = {}
@@ -97,6 +99,7 @@ def flatten(tree, resolver=None, prefix="", counter=None):
                 instances[entry[1]] = vtype[1]
     builtin = set(REGISTER_ARGS) | set(BUFFERS) | {"EXP", "TRI"}
     out_vars, out_stmts, out_consts = [], [], []
+    bidir_nets = set()                                    # instances' BIDIR ports, merged below
 
     def load(kind):
         text = resolver(kind) if resolver else None
@@ -111,10 +114,18 @@ def flatten(tree, resolver=None, prefix="", counter=None):
         out_consts.extend(c)
         ins, outs, defaults = [], [], []
         for names, direction, default in p:
-            if direction not in ("INPUT", "OUTPUT"):
+            if direction == "BIDIR":                       # one wire with whatever it connects to
+                for n in names:
+                    if n[2] is not None:
+                        raise Unsupported("BIDIR group port on an instantiated design")
+                    bidir_nets.add(n[1])
+            elif direction in ("MACHINE INPUT", "MACHINE OUTPUT"):
+                out_vars.append((names, ("machine", [], None)))     # an alias of the machine connected
+            elif direction in ("INPUT", "OUTPUT"):
+                out_vars.append((names, ("prim", "NODE")))
+            else:
                 raise Unsupported("%s port on an instantiated design" % direction)
-            out_vars.append((names, ("prim", "NODE")))
-            (ins if direction == "INPUT" else outs).extend(names)
+            (ins if direction.endswith("INPUT") else outs).extend(names)
             if default is not None:
                 defaults.extend(("eq", n if n[2] is None else ("name", n[1], ()), default) for n in names)
         out_vars.extend(v)
@@ -245,7 +256,53 @@ def flatten(tree, resolver=None, prefix="", counter=None):
                      [(prefix + state, value if value is None else rename(value, [])) for state, value in vtype[2]])
         out_vars.append(([rename(n, []) for n in names], vtype))
     body = stmts(statements)
-    return out_consts, flat_ports, out_vars, out_stmts + body
+    everything = out_stmts + body
+    if bidir_nets:
+        everything, out_vars = _merge_bidir(out_stmts, body, out_vars, bidir_nets)
+    return out_consts, flat_ports, out_vars, everything
+
+
+def _merge_bidir(inner, statements, variables, nets):
+    """An instance's BIDIR port is the same wire as the signal it is connected to: drop each
+    connecting equation (in the parent's own statements) and rename the port to that signal
+    everywhere, the instances' statements (`inner`) included."""
+    to = {}
+    kept = []
+    for st in statements:
+        if st[0] == "eq":
+            a, b = st[1], st[2]
+            for x, y in ((a, b), (b, a)):
+                if x[0] == "name" and x[1] in nets and x[2] is None and y[0] == "name" and x[1] not in to:
+                    to[x[1]] = y
+                    break
+            else:
+                kept.append(st)
+                continue
+            continue
+        kept.append(st)
+
+    def target(name):
+        seen = set()
+        node = ("name", name, None)
+        while node[0] == "name" and node[1] in to and node[1] not in seen and node[2] is None:
+            seen.add(node[1])
+            node = to[node[1]]
+        return node
+
+    def sub(node):
+        if not isinstance(node, (tuple, list)):
+            return node
+        if isinstance(node, list):
+            return [sub(x) for x in node]
+        if node and node[0] == "name" and node[2] is None and node[1] in nets:
+            if node[1] not in to:
+                return node
+            return target(node[1])
+        return tuple(sub(x) for x in node)
+    loose = [n for n in nets if n not in to]              # connected to nothing: an internal node
+    if loose:
+        variables = variables + [([("name", n, None) for n in loose], ("prim", "NODE"))]
+    return [sub(st) for st in inner + kept], variables
 
 
 REGISTER_ARGS = {"DFF": ("d", "clk", "clrn", "prn"), "DFFE": ("d", "clk", "clrn", "prn", "ena"),
@@ -313,8 +370,12 @@ class Design:
             self.constants[name] = _const(self.constants, expr)
         self.inputs, self.outputs, self.groups, self.aliases, self.bidir = [], [], {}, {}, []
         self.tri = set()                                   # signals driven through TRI(in, oe)
+        machine_ports = []                                 # (name, direction): sized once machines exist
         for names, direction, _ in ports:
             for entry in names:
+                if direction in ("MACHINE INPUT", "MACHINE OUTPUT"):
+                    machine_ports.append((entry[1], direction))
+                    continue
                 bits = self._declare(entry)
                 if direction not in ("INPUT", "OUTPUT", "BIDIR"):
                     raise Unsupported("port direction %s" % direction)
@@ -323,8 +384,18 @@ class Design:
                     self.bidir.extend(bits)
         self.nodes, self.flops, self.machines, self.states = [], {}, {}, {}
         self.known = set(self.inputs) | set(self.outputs)
+        self.tri_vars = set()                              # bits of TRI primitives used as variables
+        self.machine_alias = {}                            # machine port / alias name -> machine
+        aliases = {n for n, _ in machine_ports}
         for names, vtype in variables:
-            if vtype == ("prim", "NODE"):
+            if vtype[0] == "machine" and not vtype[2]:     # "x : MACHINE;": an alias declaration
+                aliases.update(e[1] for e in names)
+            elif vtype == ("prim", "TRI"):
+                for entry in names:
+                    for bit in self._declare(entry):
+                        self.tri_vars.add(bit)
+                        self.nodes.extend([bit + "~in", bit + "~oe"])
+            elif vtype == ("prim", "NODE"):
                 for entry in names:
                     self.nodes.extend(self._declare(entry))
             elif vtype[0] == "prim" and vtype[1] in ("DFF", "DFFE", "TFF", "TFFE"):
@@ -338,7 +409,87 @@ class Design:
                 raise Unsupported("variable type %r" % (vtype[:2],))
         self.known |= set(self.nodes)
         self.flops.update(inline_flops)
+        if aliases:
+            self.statements = self._resolve_machine_aliases(self.statements, aliases)
+        for name, direction in machine_ports:
+            if name not in self.machine_alias:
+                raise Unsupported("machine port %s is connected to no state machine%s" % (
+                    name, " (its state names come from the machine it is connected to, so this "
+                    "design is used inside another one)" if direction == "MACHINE INPUT" else ""))
+            if direction == "MACHINE OUTPUT":              # a top-level machine output: its state bits on pins
+                bits = self.machines[self.machine_alias[name]][0]
+                pins = ["%s%d" % (name, i) for i in range(len(bits) - 1, -1, -1)]
+                self.groups[name] = pins
+                self.outputs.extend(pins)
+                self.known.update(pins)
+                self.statements += [("eq", ("name", p, None), ("name", b, None)) for p, b in zip(pins, bits)]
+        if self.tri_vars:
+            self.statements = self._tri_outputs(self.statements)
         self._find_tri(self.statements)
+
+    def _resolve_machine_aliases(self, stmts, aliases):
+        """`a = b` between machine aliases and machines joins them; each alias then reads as its
+        machine, and the machine's state names are also known under the alias's design prefix."""
+        links, kept = {}, []
+        for st in stmts:
+            if st[0] == "eq" and st[1][0] == "name" and st[2][0] == "name" and st[1][2] is None and \
+                    st[2][2] is None and (st[1][1] in aliases or st[2][1] in aliases):
+                a, b = st[1][1], st[2][1]
+                links.setdefault(a, set()).add(b)
+                links.setdefault(b, set()).add(a)
+            else:
+                kept.append(st)
+        for alias in aliases:
+            seen, todo, found = set(), [alias], None
+            while todo:
+                n = todo.pop()
+                if n in seen:
+                    continue
+                seen.add(n)
+                if n in self.machines:
+                    found = n
+                todo += links.get(n, ())
+            if found is None:
+                continue
+            self.machine_alias[alias] = found
+            bits, values, _ = self.machines[found]
+            mine, theirs = alias.rpartition("/")[0], found.rpartition("/")[0]
+            for state, value in values.items():
+                if state.startswith(theirs + "/" if theirs else ""):
+                    local = state[len(theirs) + 1:] if theirs else state
+                    self.states.setdefault((mine + "/" if mine else "") + local, (value, len(bits)))
+        return kept
+
+    def _tri_outputs(self, stmts):
+        """`pins = x[].out` for TRI variables x: each pin becomes TRI(x.in, x.oe), bit by bit."""
+        out = []
+        for st in stmts:
+            if st[0] == "eq":
+                src = st[2]
+                inner = src[1] if src[0] == "port" and src[2][1].lower() == "out" else src
+                bits = None
+                if inner[0] == "name" and inner[2] in (None, ()):
+                    whole = self.groups.get(inner[1], [inner[1]])
+                    bits = whole if all(x in self.tri_vars for x in whole) else None
+                elif inner[0] == "name" and inner[2] and len(inner[2]) == 1:
+                    bit = "%s%d" % (inner[1], _const(self.constants, inner[2][0]))
+                    bits = [bit] if bit in self.tri_vars else None
+                if bits:
+                    targets = self._bits(st[1], lvalue=True)
+                    if len(targets) != len(bits):
+                        raise Unsupported("TRI output width mismatch")
+                    for t, b in zip(targets, bits):
+                        out.append(("eq", ("name", t, None),
+                                    ("call", "tri", [("name", b + "~in", None), ("name", b + "~oe", None)])))
+                    continue
+                out.append(st)
+            elif st[0] == "if":
+                out.append(("if", [(c, self._tri_outputs(b)) for c, b in st[1]], self._tri_outputs(st[2])))
+            elif st[0] == "case":
+                out.append(("case", st[1], [(v, self._tri_outputs(b)) for v, b in st[2]]))
+            else:
+                out.append(st)
+        return out
 
     def _find_tri(self, stmts):
         for st in stmts:
@@ -390,6 +541,7 @@ class Design:
         kind = node[0]
         if kind == "name":
             _, name, rng = node
+            name = self.machine_alias.get(name, name)
             if rng is None:
                 bits = list(self.groups[name]) if name in self.machines else [self.aliases.get(name, name)]
             elif rng == () and name not in self.groups:
@@ -411,14 +563,21 @@ class Design:
             return [self._pin(b, None, lvalue) for b in bits]
         if kind == "port":
             port = node[2][1].lower()
-            if node[1][1] in self.machines:
-                return ["%s.%s" % (node[1][1], port)]
+            machine = self.machine_alias.get(node[1][1], node[1][1])
+            if machine in self.machines:
+                return ["%s.%s" % (machine, port)]
             return [self._pin(b.split(".")[0], port, lvalue) for b in self._bits(node[1], lvalue=True)]
         if kind == "group":
             return [b for item in node[1] if item is not None for b in self._bits(item, lvalue)]
         raise Unsupported("not a signal reference: %r" % (node,))
 
     def _pin(self, bit, port, lvalue):
+        if bit in self.tri_vars:
+            if port in ("in", "oe"):
+                return "%s~%s" % (bit, port)
+            if port is None and lvalue:                   # the base of x.in / x.oe
+                return bit
+            raise Unsupported("TRI %s read other than onto a pin" % bit)
         kind = self.flops.get(bit)
         if kind is None:
             if port is not None:
