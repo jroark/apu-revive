@@ -36,7 +36,7 @@ def cmd_adapter(args):
     print("adapter ID %d (%#x): %s" % (aid, aid, board.KNOWN_ADAPTERS.get(aid, "unknown")))
 
 
-DEVICE_FILES = {"EPM7160E": "e7160084.pcf", "EPM7160EQC160": "e7160120.pcf", "EPM7064": "m7064084.pcf", "EPM7032": "m7032044.pcf"}
+DEVICE_FILES = {"EPM7160E": "e7160084.pcf", "EPM7160EQC160": "e7160120.pcf", "EPM7192EQC160": "e7192160.pcf", "EPM7064": "m7064084.pcf", "EPM7032": "m7032044.pcf"}
 
 
 def _open_for(args):
@@ -216,7 +216,7 @@ def cmd_synth(args):
 
 
 FIT_DEVICES = {"EPM7032": "m7032044.daf", "EPM7064": "m7064084.daf", "EPM7096": "m7096084.daf",
-               "EPM7128": "m7128084.daf", "EPM7160E": "e7160084.daf"}
+               "EPM7128": "m7128084.daf", "EPM7160E": "e7160084.daf", "EPM7064S": "s7064044.daf"}
 
 
 def cmd_fit(args):
@@ -239,6 +239,107 @@ def cmd_fit(args):
     except fit.DoesNotFit as e:
         print("pin assignment failed: %s" % e)
     print("-- resource fit only: signals are not routed and no programming file is produced")
+
+
+def cmd_compile(args):
+    """Design -> synthesis -> fit -> programming file (EPM7032, EPM7064S 44-pin, EPM7128S 84-pin)."""
+    from . import acf, ahdl, ahdl_eval, daf, fit, fusemap, gdf, generate, jedec, maf, parts, pof, project, synth
+    path = pathlib.Path(args.file)
+    text = gdf.to_ahdl(path.read_bytes(), path.stem) if path.suffix.lower() == ".gdf" else path.read_text(encoding="latin1")
+    resolver = ahdl_eval.directory_resolver(path.parent, *ahdl_eval.vendor_library(DEFAULT_VENDOR))
+    sections = acf.parse(path.with_suffix(".acf").read_text(encoding="latin1")) if path.with_suffix(".acf").exists() else []
+    try:
+        net = synth.synthesise(text, resolver)
+        device = args.device or acf.device(sections, path.stem)
+        if not device or device.upper() == "AUTO":
+            device = "EPM7032LC44"                       # the only device programming data is generated for
+        part = parts.lookup(parts.load(DEFAULT_VENDOR / "partinfo.crf"), device)
+        if part is None or part.daf not in ("m7032044", "s7064044", "s7128084"):
+            sys.exit("%s: programming data can only be generated for the EPM7032, EPM7064S (44-pin) and EPM7128S (84-pin) so far" % device)
+        k = DEFAULT_VENDOR.parent / "7k"
+        if part.daf == "s7064044":
+            from . import generate7064s
+            fm = fusemap.FuseMap(daf.parse((k / "s7064044.daf").read_bytes()), maf.parse((k / "m7064s.maf").read_bytes()))
+            fuses, fitted = generate7064s.compile_netlist(net, part, k, acf.pins(sections, path.stem), fm)
+        elif part.daf == "s7128084":
+            from . import generate7064s, s7k
+            tables = s7k.Tables.load("7128s")
+            fm = fusemap.FuseMap(daf.parse((k / "s7128084.daf").read_bytes()), maf.parse((k / "m7128s.maf").read_bytes()))
+            fuses, fitted = generate7064s.compile_netlist(net, part, k, acf.pins(sections, path.stem), fm, tables)
+        else:
+            fitted = project.fit_part(net, part, k, acf.pins(sections, path.stem))
+            fm = fusemap.FuseMap(daf.parse((k / (part.daf + ".daf")).read_bytes()), maf.parse((k / (part.maf + ".maf")).read_bytes()))
+            fuses = generate.generate(net, fitted.result, fitted.placement, fitted.pins, fm)
+    except (ahdl.AhdlError, ahdl_eval.Unsupported, synth.TooLarge, fit.DoesNotFit, generate.CannotGenerate) as e:
+        sys.exit("%s: %s" % (args.file, e))
+    out = pathlib.Path(args.output or path.with_suffix(".pof"))
+    out.write_bytes(pof.fuses_to_logical_pof(fuses, part.name.split("-")[0], "apu-revive").to_bytes())
+    print("%s: %s, %d of %d macrocells -> %s" % (path.name, part.name.split("-")[0],
+                                                 sum(c.macrocells for c in fitted.result.cells), fm.macrocells, out))
+    print("pins: " + ", ".join("%s=%d" % kv for kv in sorted(fitted.pins.items(), key=lambda kv: kv[1])))
+    if getattr(args, "svf", None):
+        if part.daf == "s7064044":
+            from . import svf7064s
+            text = svf7064s.write(fuses, "program")
+        elif part.daf == "s7128084":
+            from . import svf_template
+            text = svf_template.write("7128s", fuses, "program")
+        else:
+            sys.exit("--svf: JTAG programming files are written for the EPM7064S and EPM7128S only")
+        pathlib.Path(args.svf).write_text(text)
+        print("SVF (erase, program, verify; JTAG stays enabled) -> %s" % args.svf)
+    if args.jed:
+        pathlib.Path(args.jed).write_bytes(jedec.write(fuses, "Compiled by apu-revive from %s" % path.name,
+                                                       device=part.name.split("-")[0]).encode("latin1"))
+        print("JEDEC -> %s" % args.jed)
+
+
+def _load_fuses(path):
+    from . import jedec, pof
+    data = pathlib.Path(path).read_bytes()
+    if path.lower().endswith(".jed"):
+        return jedec.parse(data.decode("latin1"))["fuses"]
+    return pof.logical_fuses(pof.Pof.from_bytes(data))
+
+
+def cmd_jtag(args):
+    """A MAX 7000S chip on a USB-Blaster: read-only actions run directly; program needs --yes."""
+    from . import jedec, jtag, pof
+    if args.action in ("read", "verify", "program") and not args.file:
+        sys.exit("jtag %s: give a file" % args.action)
+    if args.action == "program" and not args.yes:
+        sys.exit("jtag program erases and reprograms the chip; run again with --yes to do it")
+    device = args.device.upper()
+    if device not in jtag.DEVICES:
+        sys.exit("jtag: devices are %s" % ", ".join(sorted(jtag.DEVICES)))
+    want = jtag.DEVICES[device][0]
+    fuses = _load_fuses(args.file) if args.action in ("verify", "program") else None
+    try:
+        with jtag.Openocd(args.interface, idcode=want) as ocd:
+            code = jtag.idcode(ocd)
+            print("IDCODE %08X%s" % (code, " (%s)" % device if code == want else " (not an %s)" % device))
+            if code != want:
+                sys.exit(1)
+            if args.action == "read":
+                fuses = jtag.read_device(ocd, device)
+                out = pathlib.Path(args.file)
+                if out.suffix.lower() == ".jed":
+                    out.write_bytes(jedec.write(fuses, "Read from an %s by apu-revive" % device, device=device).encode("latin1"))
+                else:
+                    out.write_bytes(pof.fuses_to_logical_pof(fuses, device, "apu-revive").to_bytes())
+                print("read %d fuses (%d programmed) -> %s" % (len(fuses), fuses.count(0), out))
+            elif args.action == "verify":
+                bad = jtag.verify_device(ocd, device, fuses)
+                print("verify: %s" % ("matches" if not bad else "%d reads differ" % len(bad)))
+                sys.exit(1 if bad else 0)
+            elif args.action == "program":
+                print("erasing, programming and verifying ...")
+                jtag.program_device(ocd, device, fuses)
+                bad = jtag.verify_device(ocd, device, fuses)
+                print("programmed; independent read-back %s" % ("matches" if not bad else "differs in %d reads" % len(bad)))
+                sys.exit(1 if bad else 0)
+    except jtag.JtagError as e:
+        sys.exit("jtag: %s" % e)
 
 
 def cmd_sim(args):
@@ -292,8 +393,10 @@ def cmd_pof2jed(args):
     p = pof.Pof.from_bytes(pathlib.Path(args.pof).read_bytes())
     if p.crc_ok is False:
         sys.exit("POF checksum is wrong")
-    pcf = _pcf_for(args, p.device)
-    fuses = jedec.fuses_from_image(pcf, pof.pof_to_image(p))
+    fuses = pof.logical_fuses(p)                  # what MAX+PLUS II writes for MAX 7000 parts
+    if fuses is None:
+        pcf = _pcf_for(args, p.device)
+        fuses = jedec.fuses_from_image(pcf, pof.pof_to_image(p))
     text = jedec.write(fuses, "Converted from %s" % pathlib.Path(args.pof).name, device=p.device,
                        security=p.flag(pof.TAG_SECURITY))
     pathlib.Path(args.jed).write_bytes(text.encode("latin1"))
@@ -330,7 +433,7 @@ def main():
         if name == "read":
             c.add_argument("out", help="JSON file to write")
             c.add_argument("--vmarg", type=int, default=2000, help="margin voltage in mV (default 2000)")
-        c.add_argument("--part", default="EPM7160E", help="device type: EPM7160E (default), EPM7160EQC160, EPM7064 or EPM7032")
+        c.add_argument("--part", default="EPM7160E", help="device type: EPM7160E (default), EPM7160EQC160, EPM7192EQC160, EPM7064 or EPM7032")
         c.add_argument("--pcf", help="device file (default: the 84-pin one for the part)")
         c.add_argument("--allow-unverified", action="store_true",
                        help="run a device whose native sequences have only been checked in simulation")
@@ -359,6 +462,21 @@ def main():
     y = sub.add_parser("synth", help="reduce a small flat AHDL design to sum-of-products equations")
     y.add_argument("file")
     y.set_defaults(fn=cmd_synth)
+    c = sub.add_parser("compile", help="compile a design (.tdf or .gdf) to a programming file (.pof); "
+                                       "device and pins from <design>.acf if present (EPM7032, EPM7064S, EPM7128S)")
+    c.add_argument("file")
+    c.add_argument("-o", "--output", help="POF to write (default: <design>.pof)")
+    c.add_argument("--jed", help="also write a JEDEC file")
+    c.add_argument("--svf", help="also write a JTAG programming file (SVF; EPM7064S)")
+    c.add_argument("--device", help="override the .acf device")
+    c.set_defaults(fn=cmd_compile)
+    j = sub.add_parser("jtag", help="EPM7064S over JTAG with a USB-Blaster (openocd): id, read, verify, program")
+    j.add_argument("action", choices=("id", "read", "verify", "program"))
+    j.add_argument("file", nargs="?", help="read: POF to write (or .jed); verify / program: POF or JEDEC to use")
+    j.add_argument("--yes", action="store_true", help="program: really erase and program the chip")
+    j.add_argument("--device", default="EPM7064S", help="EPM7064S (default) or EPM7128S")
+    j.add_argument("--interface", default="interface/altera-usb-blaster.cfg", help="openocd interface config")
+    j.set_defaults(fn=cmd_jtag)
     z = sub.add_parser("fit", help="check that an AHDL design fits a device's macrocells and blocks "
                                    "(no routing, no programming file)")
     z.add_argument("file")

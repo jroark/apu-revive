@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read a device's silicon ID using Altera's module under emulation.
 
-usage: read_siid.py PART_NAME [--variant N] [--real]     e.g. EPM7160ELC84-15
+usage: read_siid.py PART_NAME [--variant N] [--real] [--isp]     e.g. EPM7160ELC84-15
 Without --real the simulated (replay) device is used.
 Sequence (from pgm.dll's pgm_read_in_silicon_id and the .pcf):
   pgd_setup(6, part_id, nominal_vcc << 16 | variant);   part_id = column 6 of partinfo.crf pgd_program_setup(1, 0, v[0x0a], v[0x0c], v[0x0e], v[0x10]);
@@ -95,6 +95,10 @@ def main():
         # ~16x longer; forcing 200 makes a known-good chip misread.
         apply_calibration(h, announce=True)
         print("select ->", h.call("pgd_setup", 6, part_id, pcf["nominal_vcc"] << 16 | variant), "type", hex(h.u32(0x1003B9D0)))
+        if "--isp" in sys.argv:
+            # pgd_setup(34, 1) sets the module's in-system-programming flag (0x1003ba1c); MAX 7000S
+            # parts are then read over JTAG (pgd_read_silicon_id -> 0x10033300)
+            print("isp mode ->", h.call("pgd_setup", 34, 1, 0))
         h.log("## program_setup")
         print("program_setup(0, vcc) ->", h.call("pgd_program_setup", 0, 0, pcf["nominal_vcc"], 0, 0, 0))
         print("program_setup(1, siid) ->", h.call("pgd_program_setup", 1, 0, *pcf["siid_volts"]))
@@ -109,6 +113,8 @@ def main():
             text = "".join(chr(v) if 32 <= v < 127 else "." for v in vals)
             print("region kind %#x row %#x col %#x: %s  %r" % (r["kind"], r["row"], r["col"], [hex(v) for v in vals], text))
     finally:
+        if "--isp" in sys.argv:
+            print("isp mode off ->", h.call("pgd_setup", 34, 0, 0))
         print("shutdown ->", h.call("pgd_setup", 3, 0, 0))
         print("log lines:", len(h.trace))
         if "--trace" in sys.argv:

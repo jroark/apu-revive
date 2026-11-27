@@ -1,0 +1,12 @@
+SUBDESIGN v01_regions
+( din[11..0] : INPUT;
+  y[6..0] : OUTPUT; )
+BEGIN
+	y0 = din0;
+	y1 = din0 & din1;
+	y2 = din0 & din1 & din2;
+	y3 = din0 & din1 & din2 & din3;
+	y4 = din0 & din1 & din2 & din3 & din4;
+	y5 = din0 & din1 & din2 & din3 & din4 & din5;
+	y6 = din0 & din1 & din2 & din3 & din4 & din5 & din6;
+END;

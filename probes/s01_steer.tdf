@@ -1,0 +1,21 @@
+SUBDESIGN s01_steer
+( a[4..0], b[4..0] : INPUT;
+  s1, s2, s3, s4, s5, x2, x3, nd, s1e, s2e, s3e, s4e, s5e, x2e, x3e, nde : OUTPUT; )
+BEGIN
+	s1 = (a0 & b0);
+	s2 = (a0 & b0) # (a1 & b1);
+	s3 = (a0 & b0) # (a1 & b1) # (a2 & b2);
+	s4 = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3);
+	s5 = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3) # (a4 & b4);
+	x2 = a0 $ b0;
+	x3 = a0 $ b0 $ a1;
+	nd = !(a0 & b0);
+	s1e = (a0 & b0);
+	s2e = (a0 & b0) # (a1 & b1);
+	s3e = (a0 & b0) # (a1 & b1) # (a2 & b2);
+	s4e = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3);
+	s5e = (a0 & b0) # (a1 & b1) # (a2 & b2) # (a3 & b3) # (a4 & b4);
+	x2e = a0 $ b0;
+	x3e = a0 $ b0 $ a1;
+	nde = !(a0 & b0);
+END;

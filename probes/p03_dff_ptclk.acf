@@ -1,0 +1,4 @@
+CHIP p03_dff_ptclk
+BEGIN
+	DEVICE = EPM7032LC44-15;
+END;

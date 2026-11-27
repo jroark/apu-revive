@@ -1,0 +1,8 @@
+SUBDESIGN p01_comb
+( a, b, c : INPUT;
+  y_and, y_or, y_nand3 : OUTPUT; )
+BEGIN
+	y_and = a & b;
+	y_or = a # b;
+	y_nand3 = !(a & b & c);
+END;

@@ -1,0 +1,10 @@
+SUBDESIGN p02_dff_gclk
+( clk, d : INPUT;
+  q : OUTPUT; )
+VARIABLE
+	r : DFF;
+BEGIN
+	r.clk = clk;
+	r.d = d;
+	q = r;
+END;

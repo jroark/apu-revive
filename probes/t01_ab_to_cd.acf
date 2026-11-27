@@ -1,0 +1,32 @@
+CHIP t01_ab_to_cd
+BEGIN
+	DEVICE = EPM7064SLC44-10;
+	|din0 : INPUT_PIN = 4;
+	|din1 : INPUT_PIN = 5;
+	|din2 : INPUT_PIN = 6;
+	|din3 : INPUT_PIN = 8;
+	|din4 : INPUT_PIN = 9;
+	|din5 : INPUT_PIN = 11;
+	|din6 : INPUT_PIN = 12;
+	|din7 : INPUT_PIN = 14;
+	|din8 : INPUT_PIN = 16;
+	|din9 : INPUT_PIN = 17;
+	|din10 : INPUT_PIN = 18;
+	|din11 : INPUT_PIN = 19;
+	|dout0 : OUTPUT_PIN = 24;
+	|dout1 : OUTPUT_PIN = 25;
+	|dout2 : OUTPUT_PIN = 26;
+	|dout3 : OUTPUT_PIN = 27;
+	|dout4 : OUTPUT_PIN = 28;
+	|dout5 : OUTPUT_PIN = 29;
+	|dout6 : OUTPUT_PIN = 31;
+	|dout7 : OUTPUT_PIN = 33;
+	|dout8 : OUTPUT_PIN = 34;
+	|dout9 : OUTPUT_PIN = 36;
+	|dout10 : OUTPUT_PIN = 37;
+	|dout11 : OUTPUT_PIN = 39;
+END;
+GLOBAL_PROJECT_SYNTHESIS_ASSIGNMENT_OPTIONS
+BEGIN
+	DEVICE_FAMILY = MAX7000S;
+END;

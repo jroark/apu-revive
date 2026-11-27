@@ -1,0 +1,36 @@
+CHIP r02_b2_to_b1
+BEGIN
+	DEVICE = EPM7032LC44-15;
+	|din0 : INPUT_PIN = 41;
+	|din1 : INPUT_PIN = 40;
+	|din2 : INPUT_PIN = 39;
+	|din3 : INPUT_PIN = 38;
+	|din4 : INPUT_PIN = 37;
+	|din5 : INPUT_PIN = 36;
+	|din6 : INPUT_PIN = 34;
+	|din7 : INPUT_PIN = 33;
+	|din8 : INPUT_PIN = 32;
+	|din9 : INPUT_PIN = 31;
+	|din10 : INPUT_PIN = 29;
+	|din11 : INPUT_PIN = 28;
+	|din12 : INPUT_PIN = 27;
+	|din13 : INPUT_PIN = 26;
+	|din14 : INPUT_PIN = 25;
+	|din15 : INPUT_PIN = 24;
+	|dout0 : OUTPUT_PIN = 4;
+	|dout1 : OUTPUT_PIN = 5;
+	|dout2 : OUTPUT_PIN = 6;
+	|dout3 : OUTPUT_PIN = 7;
+	|dout4 : OUTPUT_PIN = 8;
+	|dout5 : OUTPUT_PIN = 9;
+	|dout6 : OUTPUT_PIN = 11;
+	|dout7 : OUTPUT_PIN = 12;
+	|dout8 : OUTPUT_PIN = 13;
+	|dout9 : OUTPUT_PIN = 14;
+	|dout10 : OUTPUT_PIN = 16;
+	|dout11 : OUTPUT_PIN = 17;
+	|dout12 : OUTPUT_PIN = 18;
+	|dout13 : OUTPUT_PIN = 19;
+	|dout14 : OUTPUT_PIN = 20;
+	|dout15 : OUTPUT_PIN = 21;
+END;

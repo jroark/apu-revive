@@ -1,0 +1,11 @@
+SUBDESIGN p06_dffe
+( clk, d, en : INPUT;
+  q : OUTPUT; )
+VARIABLE
+	r : DFFE;
+BEGIN
+	r.clk = clk;
+	r.d = d;
+	r.ena = en;
+	q = r;
+END;

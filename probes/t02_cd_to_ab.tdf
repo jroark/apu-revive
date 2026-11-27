@@ -1,0 +1,6 @@
+SUBDESIGN t02_cd_to_ab
+( din[11..0] : INPUT;
+  dout[11..0] : OUTPUT; )
+BEGIN
+	dout[] = din[];
+END;

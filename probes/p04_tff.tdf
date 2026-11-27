@@ -1,0 +1,10 @@
+SUBDESIGN p04_tff
+( clk, t : INPUT;
+  q : OUTPUT; )
+VARIABLE
+	r : TFF;
+BEGIN
+	r.clk = clk;
+	r.t = t;
+	q = r;
+END;

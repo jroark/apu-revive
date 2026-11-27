@@ -1,0 +1,6 @@
+SUBDESIGN p09_xor
+( a, b, c : INPUT;
+  y : OUTPUT; )
+BEGIN
+	y = a $ b $ c;
+END;

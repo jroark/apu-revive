@@ -1,0 +1,7 @@
+SUBDESIGN w02_fanout
+( a, b : INPUT;
+  ya0, ya1, ya2, yb0, yb1, yb2 : OUTPUT; )
+BEGIN
+	ya0 = a; ya1 = a; ya2 = a;
+	yb0 = b; yb1 = b; yb2 = b;
+END;

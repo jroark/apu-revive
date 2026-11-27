@@ -79,9 +79,55 @@ class Synthesise(unittest.TestCase):
             self.assertEqual(net.registers[bit]["clk"].text(), "clk")
         self.assertIn("red = ", net.report())
 
-    def test_limit_is_per_function(self):
-        wide = "SUBDESIGN big ( a[15..0] : INPUT; y : OUTPUT; ) BEGIN y = (a[] == 5); END;"
-        self.assertRaises(synth.TooLarge, synth.synthesise, wide)
+    def test_wide_functions_go_symbolic(self):
+        wide = "SUBDESIGN big ( a[15..0] : INPUT; y, z : OUTPUT; ) BEGIN y = (a[] == 5); z = (a[] > 40000); END;"
+        net = synth.synthesise(wide)
+        self.assertEqual(len(net.outputs["y"].terms), 1)
+        self.assertEqual(len(net.outputs["y"].terms[0]), 16)
+        import random
+        rng = random.Random(1)
+        for value in [5, 4, 40000, 40001, 65535, 0] + [rng.randrange(65536) for _ in range(300)]:
+            env = {"a%d" % i: (value >> i) & 1 for i in range(16)}
+            self.assertEqual(net.outputs["y"].evaluate(env), int(value == 5), value)
+            self.assertEqual(net.outputs["z"].evaluate(env), int(value > 40000), value)
+
+    def test_symbolic_agrees_with_tabulation(self):
+        # BDD evaluation with irredundant covers everywhere, against settling every assignment
+        designs = (BOOLE, COUNTER, DECODE, LIGHTS, PRIORITY, TABLE)
+        old_sym, old_max = synth.Symbolic, synth.MAX_SUPPORT
+
+        def no_bdd(design):
+            raise ahdl_eval.Unsupported("disabled for the test")
+        try:
+            synth.Symbolic = no_bdd
+            exhaustive = [synth.synthesise(t) for t in designs]
+            synth.Symbolic, synth.MAX_SUPPORT = old_sym, -1
+            symbolic = [synth.synthesise(t) for t in designs]
+        finally:
+            synth.Symbolic, synth.MAX_SUPPORT = old_sym, old_max
+        for text, a, b in zip(designs, exhaustive, symbolic):
+            pairs = [(a.outputs[k], b.outputs[k], k) for k in a.outputs]
+            pairs += [(a.enables[k], b.enables[k], k) for k in a.enables]
+            for bit in a.registers:
+                ra, rb = a.registers[bit], b.registers[bit]
+                self.assertEqual(set(ra) - {"d", "t"}, set(rb) - {"d", "t"}, bit)
+                pairs += [(ra[p], rb[p], bit + "." + p) for p in ra if p not in ("d", "t")]
+                pairs.append((ra, rb, bit))                      # D or T: compare the next state
+            for x, y, key in pairs:
+                if isinstance(x, dict):
+                    eqs = [e for r in (x, y) for p, e in r.items() if p in ("d", "t")]
+                    nxt = lambda r, env, key=key: (r["d"].evaluate(env) if "d" in r
+                                                   else r["t"].evaluate(env) ^ env[key + ".q"])
+                else:
+                    eqs, nxt = [x, y], None
+                names = sorted({n for e in eqs for t in e.terms for n in t} | ({key + ".q"} if nxt else set()))
+                for values in itertools.product((0, 1), repeat=len(names)):
+                    env = dict(zip(names, values))
+                    if nxt:
+                        self.assertEqual(nxt(x, env), nxt(y, env), key)
+                    else:
+                        self.assertEqual(x.evaluate(env), y.evaluate(env), key)
+
         # 24 inputs, but each output depends on only three of them
         split = "SUBDESIGN wide ( a[7..0], b[7..0], c[7..0] : INPUT; y[7..0] : OUTPUT; ) BEGIN y[] = a[] & b[] # !c[]; END;"
         net = synth.synthesise(split)
@@ -106,3 +152,28 @@ class Synthesise(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import pathlib
+VENDOR = pathlib.Path(__file__).resolve().parent.parent / "vendor/maxplus2-10.2"
+
+
+@unittest.skipUnless(VENDOR.exists(), "vendor files not extracted")
+class WholeTutorialDesign(unittest.TestCase):
+    def test_chiptrip_netlist_matches_the_design(self):
+        import random
+        tutorial = VENDOR / "MAX+plus_II_Tutorial/chiptrip"
+        text = (tutorial / "chiptrip.tdf").read_text(encoding="latin1")
+        resolver = ahdl_eval.directory_resolver(tutorial, *ahdl_eval.vendor_library(VENDOR / "MAX+plus_II_BASELINE"))
+        net = synth.synthesise(text, resolver)
+        self.assertEqual(len(net.registers), 18)        # ticket counter's unobservable half swept away
+        ref = ahdl_eval.Simulator(text, resolver)
+        mine = synth.NetlistSimulator(net, ref.q)
+        d, rng = ref.design, random.Random(7)
+        for step in range(600):
+            name = rng.choice(d.inputs)
+            value = 0 if name == "reset" and rng.random() < 0.8 else 1 - ref.inputs[name]
+            ref.set(**{name: value})
+            mine.set(**{name: value})
+            self.assertEqual({p: ref.env[p] for p in d.outputs}, {p: mine.env[p] for p in d.outputs}, step)
+            self.assertEqual({b: ref.q[b] for b in net.registers}, mine.q, step)

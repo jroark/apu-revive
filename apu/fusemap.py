@@ -12,10 +12,34 @@ What is established and what is not:
     the routing decode is not established and columns are shown as cN;
   - what most option elements do: NOT known. Elements are reported by number.
 From asm.dll's product-term routine (0x10004c83): a term with no fuses programmed is the constant
-VCC and one with all its fuses programmed is GND; a signal on block input m uses word line 2m
-for the true literal and 2m + 1 for the inverted one; each shared expander has one word line.
+VCC and one with all its fuses programmed is GND; each shared expander has one word line. A
+signal on block input m uses columns 2m and 2m + 1; vendor-compiled POFs show 2m + 1 is the true
+literal and 2m the complement (my earlier reading of asm.dll had them the other way round).
 """
 from . import daf as daf_module
+
+
+def _epm7032_option_fuse(f: int) -> int:
+    """Where an EPM7032 option fuse the assembler file names really is (found from
+    vendor-compiled POFs, 2026-11-26).
+
+    The file gives each macrocell twelve consecutive fuses from 14080. In the POFs the
+    macrocells come in pairs sharing a 24-fuse row of six nibbles N0..N5: the odd macrocell's
+    twelve fuses are N0 N1 N3 and the even one's N5 N2 N4 (unused cells and identical used
+    cells then read the same in both positions). The per-pin fuses from 14608 (element 34, two
+    per pin) are numbered in reversed groups of four: the file's row for macrocell k is really
+    macrocell ((k - 1) XOR 3) + 1's, the same reversal as the routing fields."""
+    if 14080 <= f < 14464:
+        offset = f - 14080
+        pair, i = divmod(offset, 24)
+        odd = i < 12
+        k = i if odd else i - 12                           # position in the file's twelve
+        nibble = (0, 1, 3)[k // 4] if odd else (5, 2, 4)[k // 4]
+        return 14080 + pair * 24 + nibble * 4 + k % 4
+    if 14608 <= f < 14672:
+        pin, bit = divmod(f - 14608, 2)
+        return 14608 + 2 * (pin ^ 3) + bit
+    return f
 
 
 class FuseMap:
@@ -65,6 +89,9 @@ class FuseMap:
                     table.setdefault(value, set()).add(self.vpterms[vp])
             self.steering[e.fields[0]] = table
         self.options = daf_module.fuse_groups(daf)          # [(element id, width, {mc: fuses})]
+        if self.fuses == 14672 and self.macrocells == 32:   # EPM7032: see _epm7032_option_fuse
+            self.options = [(eid, w, {mc: tuple(_epm7032_option_fuse(f) for f in fs) for mc, fs in rows.items()})
+                            for eid, w, rows in self.options]
         # exp_wl[k] is the single word line of shared expander k
         self.expander_of = {v: k for k, v in enumerate(daf.tables["exp_wl"]) if k and v != 0xFFFFFFFF}
         self.expander_columns = sorted(self.expander_of)
@@ -80,6 +107,18 @@ class FuseMap:
             cols = [c for c, b in enumerate(bits) if b == 0]
             out.append(None if not cols else "all" if len(cols) == self.inputs else cols)
         return out
+
+    def word(self, fuses, macrocell: int):
+        """The macrocell's twelve option fuses p0..p11 in the order apu.fusesim describes (the
+        assembler file's element order 24 25 26 27 28 1 29 30 31 31 6 32, at their real
+        positions)."""
+        out = []
+        for eid, _, rows in self.options:
+            if eid in (24, 25, 26, 27, 28, 1, 29, 30, 31, 6, 32) and macrocell in rows:
+                out.append((eid, [fuses[f] for f in rows[macrocell]]))
+        order = (24, 25, 26, 27, 28, 1, 29, 30, 31, 6, 32)
+        bits = dict(out)
+        return [b for eid in order for b in bits[eid]]
 
     def option_bits(self, fuses, macrocell: int):
         """{element id: value} with the element's fuses read most significant first."""
@@ -102,31 +141,49 @@ class FuseMap:
         for eid, table in self.steering.items():
             if eid not in values:
                 continue
-            # an element only decides among the equation types it lists for a term
+            # An element decides only the term it governs (the term most of its entries name), and
+            # only if it chooses between at least two roles for it. A single-entry element (the
+            # E family's 82, set to 1 on every macrocell of two real chips) is a dependency note,
+            # not a select; cross-term entries (element 25 naming term 0) are ignored.
             listed = {pair for pairs in table.values() for pair in pairs}
+            terms = [t for _, t in listed]
+            governed = max(set(terms), key=terms.count) if terms else None
+            mine = {p for p in listed if p[1] == governed}
+            if len(mine) < 2:
+                continue
             allowed = table.get(values[eid], set())
-            for eq, term in listed - allowed:
+            for eq, term in mine - allowed:
                 roles[term].discard(eq)
         return {term: sorted(eqs) for term, eqs in sorted(roles.items())}
+
+    def block_value(self, fuses, block: int, m: int) -> int:
+        """Select value of block input m (product-term columns 2m and 2m + 1): the two fuses at
+        the block's m-th routing-field address, first fuse the LOW bit."""
+        address = self.routing_addresses[(block - 1) * 36 + m]
+        return fuses[address + 1] << 1 | fuses[address]
+
+    def block_sources(self, block: int, m: int) -> dict:
+        """{value: source} for block input m. The architecture file's source lists sit four
+        apart from their fields in reversed groups: block input m is read with the list the
+        file gives for field m XOR 3 of the same block."""
+        return self.routing[(block - 1) * 36 + (m ^ 3)][1]
 
     def block_inputs(self, fuses, block: int):
         """Names of the 36 signals routed into a logic array block (numbered from 1), or None
         when this device's routing decode is not established.
 
-        Confirmed on a real EPM7032: a field's two fuses are a binary number, first fuse high,
-        that selects among the architecture file's sources; "pinN" is the pin of macrocell N
-        used as an input, "mcN" macrocell N's feedback, "inK" a dedicated input (numbered as
-        the architecture file's entries beyond the macrocells). The check: with this reading
-        the pins used as inputs are exactly the macrocells whose output enable is off.
+        Established on the EPM7032 from vendor-compiled POFs of designs with known pins
+        (2026-11-26; all 32 observations of two probes, no exceptions): block input m's value
+        is `block_value`, looked up in `block_sources`; I/O entry i is the pin of macrocell
+        i + 1. Names: "pinN" = the pin of macrocell N used as an input, "mcN" = macrocell N's
+        feedback, "inK" = dedicated input K. Values 0 and 1 (macrocell feedback in the file)
+        follow the same binary reading but were not yet seen with known sources.
         """
         if self.routing is None:
             return None
         names = []
         for m in range(36):
-            index = (block - 1) * 36 + m
-            address = self.routing_addresses[index]
-            value = fuses[address] << 1 | fuses[address + 1]
-            source = self.routing[index][1].get(value)
+            source = self.block_sources(block, m).get(self.block_value(fuses, block, m))
             if source is None:
                 names.append("?")
             elif source[0] == "mc":
@@ -169,9 +226,11 @@ class FuseMap:
                     def literal(c):
                         if c in self.expander_of:
                             return "exp%d" % self.expander_of[c]
-                        # asm.dll: a signal on block input m uses word line 2m, and 2m + 1 inverted
+                        # Block input m feeds columns 2m (complement) and 2m + 1 (true signal):
+                        # checked on vendor-compiled EPM7032 POFs (an AND of two inputs uses the
+                        # odd columns; a shared expander of complemented inputs the even ones).
                         name = names[c // 2] if names else "in%d" % (c // 2)
-                        return ("!" if c % 2 else "") + name
+                        return ("" if c % 2 else "!") + name
                     text = " & ".join(literal(c) for c in t)
                 lines.append("    term %d [%s]: %s" % (i, role, text))
         rest = self.other_fuses()

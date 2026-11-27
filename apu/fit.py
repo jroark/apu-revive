@@ -1,6 +1,6 @@
 """Resource fitting for MAX 7000 devices: does a synthesised design fit, and where would it go?
 
-This is the first half of a fitter. It packs a Netlist's outputs and registers into macrocells
+This is the first half of a fitter. It packs a Netlist's outputs, registers and buried logic cells into macrocells
 and logic array blocks under the architecture's published limits and reports the result. It
 does not route signals or produce fuses (the routing encoding is not decoded yet), so a design
 that passes here is not guaranteed to be routable.
@@ -89,14 +89,18 @@ def _signals(*equations):
     return out
 
 
-def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
-    """Pack `netlist` into a device with `macrocells` macrocells. Raises DoesNotFit."""
+def cells_of(netlist, global_clocks: int = 1, not_global=()):
+    """The macrocells a netlist needs: (cells with their lenders, global clocks, global clear).
+    Inputs in `not_global` (assigned to pins other than the dedicated ones) are not made the
+    global clock or clear. Raises DoesNotFit when one sum needs more product terms than a
+    macrocell can gather."""
     inputs = set(netlist.design.inputs)
+    candidates = inputs - set(not_global)
     # choose the global clock: the input pin clocking the most registers
     votes = {}
     for eqs in netlist.registers.values():
         pin = _single_input(eqs["clk"], inputs) if "clk" in eqs else None
-        if pin:
+        if pin and pin in candidates:
             votes[pin] = votes.get(pin, 0) + 1
     clocks = sorted(votes, key=lambda p: -votes[p])[:global_clocks]
     clears = {}
@@ -105,7 +109,8 @@ def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
             eq = eqs["clrn"]
             if eq.invert is False and len(eq.terms) == 1 and len(eq.terms[0]) == 1:
                 (signal, value), = eq.terms[0].items()
-                if signal in inputs:
+                # the global clear pin is active low: it can only implement clrn = <pin>
+                if signal in candidates and value == 1:
                     clears[(signal, value)] = clears.get((signal, value), 0) + 1
     global_clear = max(clears, key=clears.get) if clears else None
 
@@ -138,6 +143,8 @@ def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
         if "t" in eqs:
             special["mode"] = "toggle"
         cells.append(Cell(bit, True, len(data.terms), special, reads))
+    for name, eq in getattr(netlist, "nodes", {}).items():     # buried combinational logic cells
+        cells.append(Cell(name, False, len(eq.terms), {}, _signals(eq)))
 
     for c in cells:
         reserved = sum(1 for k, v in c.special.items() if v == "term" and k != "mode")
@@ -147,16 +154,43 @@ def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
                 c.name, c.sum_terms, MAX_TERMS - reserved))
         if c.sum_terms > own:
             c.lenders = -(-(c.sum_terms - own) // TERMS_PER_MACROCELL)
+    return cells, clocks, global_clear
+
+
+def macrocells_needed(netlist) -> int:
+    return sum(c.macrocells for c in cells_of(netlist)[0])
+
+
+def fit(netlist, device: str, macrocells: int, global_clocks: int = 1, pinned=None, not_global=(),
+        pin_slots=None, block_caps=None) -> Fit:
+    """Pack `netlist` into a device with `macrocells` macrocells. `pinned` = {cell name:
+    macrocell} fixes cells (from pin assignments; see pin_constraints). `pin_slots`: per block,
+    how many of its macrocells have a pin (cells driving output pins need one); None = all.
+    `block_caps`: per block, how many macrocells to fill at most (default 16 each).
+    Raises DoesNotFit."""
+    cells, clocks, global_clear = cells_of(netlist, global_clocks, not_global)
+    pinned = pinned or {}
     needed = sum(c.macrocells for c in cells)
     if needed > macrocells:
         raise DoesNotFit("needs %d macrocells; %s has %d" % (needed, device, macrocells))
 
     blocks = [[] for _ in range(macrocells // BLOCK_SIZE)]
+    for c in cells:                                   # assigned cells go to their macrocell's block
+        if c.name in pinned:
+            c.block = (pinned[c.name] - 1) // BLOCK_SIZE
+            blocks[c.block].append(c)
+    for i, block in enumerate(blocks):
+        if sum(x.macrocells for x in block) > BLOCK_SIZE:
+            raise DoesNotFit("the cells assigned to block %d need more than %d macrocells" % (i + 1, BLOCK_SIZE))
+    owners = {_owner(netlist, o) for o in netlist.design.outputs if o in netlist.outputs}
     # largest input sets first; put each cell where it adds the fewest new block inputs
-    for c in sorted(cells, key=lambda c: -len(c.inputs)):
+    caps = block_caps or [BLOCK_SIZE] * len(blocks)
+    for c in sorted((c for c in cells if c.name not in pinned), key=lambda c: -len(c.inputs)):
         best = None
         for i, block in enumerate(blocks):
-            if sum(x.macrocells for x in block) + c.macrocells > BLOCK_SIZE:
+            if sum(x.macrocells for x in block) + c.macrocells > caps[i]:
+                continue
+            if pin_slots is not None and c.name in owners and sum(x.name in owners for x in block) >= pin_slots[i]:
                 continue
             present = set().union(*(x.inputs for x in block)) if block else set()
             total = len(present | c.inputs)
@@ -166,7 +200,8 @@ def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
             if best is None or cost < best[0]:
                 best = (cost, i)
         if best is None:
-            raise DoesNotFit("%s cannot be placed: no block has room within the %d-input limit" % (c.name, BLOCK_INPUTS))
+            raise DoesNotFit("%s cannot be placed: no block has room within the %d-input limit%s" % (
+                c.name, BLOCK_INPUTS, " and a free pin" if pin_slots is not None and c.name in owners else ""))
         c.block = best[1]
         blocks[best[1]].append(c)
     return Fit(device, cells, blocks, clocks[0] if clocks else None,
@@ -176,10 +211,39 @@ def fit(netlist, device: str, macrocells: int, global_clocks: int = 1) -> Fit:
 # Dedicated input pins by package: (global clock, global clear, output enable 1, output enable 2
 # / second clock). From the MAX 7000 data sheet pin-out tables; the assembler file's oe_pin
 # table gives the same two enable pins.
-DEDICATED = {44: (43, 1, 44, 2), 84: (83, 1, 84, 2)}
+DEDICATED = {44: (43, 1, 44, 2), 68: (67, 1, 68, 2), 84: (83, 1, 84, 2)}
 
 
-def assign_pins(result: Fit, netlist, pin_mc):
+def _owner(netlist, pin_name):
+    """The cell that drives an output pin: the pin's own, or the register it repeats."""
+    eq = netlist.outputs[pin_name]
+    if len(eq.terms) == 1 and len(eq.terms[0]) == 1 and not eq.invert and pin_name not in netlist.enables:
+        (signal, value), = eq.terms[0].items()
+        if value == 1 and signal.endswith(".q") and signal[:-2] in netlist.registers:
+            return signal[:-2]
+    return pin_name
+
+
+def pin_constraints(netlist, fixed, pin_mc):
+    """From pin assignments {port: pin}: ({cell: macrocell} for assigned outputs, the inputs
+    assigned away from the dedicated clock and clear pins). Raises DoesNotFit for a pin the
+    package lacks or an output on a pin with no macrocell."""
+    pins = len(pin_mc) - 1
+    gclk, gclr = DEDICATED[pins][:2] if pins in DEDICATED else (None, None)
+    pinned, not_global = {}, []
+    for port, pin in fixed.items():
+        if not 1 <= pin <= pins:
+            raise DoesNotFit("%s is assigned to pin %d; the package has %d" % (port, pin, pins))
+        if port in netlist.outputs:
+            if not pin_mc[pin]:
+                raise DoesNotFit("output %s is assigned to pin %d, which has no macrocell" % (port, pin))
+            pinned[_owner(netlist, port)] = pin_mc[pin]
+        elif port in netlist.design.inputs and pin not in (gclk, gclr):
+            not_global.append(port)
+    return pinned, not_global
+
+
+def assign_pins(result: Fit, netlist, pin_mc, fixed=None):
     """Give every cell a macrocell number and every port a pin.
 
     `pin_mc` is the device file's table: pin_mc[pin] = macrocell on that pin, 0 if none.
@@ -194,13 +258,42 @@ def assign_pins(result: Fit, netlist, pin_mc):
         raise DoesNotFit("no dedicated-pin table for a %d-pin package" % pins)
     gclk, gclr, oe1, oe2 = DEDICATED[pins]
     pin_of = {mc: pin for pin, mc in enumerate(pin_mc) if mc}
+    fixed = fixed or {}
+    pinned, _ = pin_constraints(netlist, fixed, pin_mc)
     placement, port_pin = {}, {}
     for b, block in enumerate(result.blocks):
-        nxt = b * BLOCK_SIZE + 1
-        for cell in block:
-            nxt += cell.lenders
-            placement[cell.name] = nxt
-            nxt += 1
+        free = set(range(b * BLOCK_SIZE + 1, (b + 1) * BLOCK_SIZE + 1))
+        for cell in block:                              # assigned cells, lenders just below them
+            if cell.name in pinned:
+                mc = pinned[cell.name]
+                need = set(range(mc - cell.lenders, mc + 1))
+                if (mc - 1) // 8 != (mc - 1 - cell.lenders) // 8:
+                    raise DoesNotFit("%s on macrocell %d cannot borrow %d expanders across a chain of 8" % (cell.name, mc, cell.lenders))
+                if not need <= free:
+                    raise DoesNotFit("macrocell %d (for %s) and its lenders are not free" % (mc, cell.name))
+                placement[cell.name] = mc
+                free -= need
+        # cells that drive an output pin go on macrocells with pins, first; buried cells take
+        # pinless macrocells when there are any (on the EPM7032 every macrocell has a pin)
+        owners = {_owner(netlist, o) for o in netlist.design.outputs if o in netlist.outputs}
+        # longest expander chains first (they need runs of free macrocells), then pin owners
+        for cell in sorted(block, key=lambda c: (-c.lenders, c.name not in owners)):
+            if cell.name in pinned:
+                continue
+            with_pin = sorted(mc for mc in free if mc in pin_of)
+            if cell.name in owners:
+                order = with_pin
+            else:
+                order = sorted(mc for mc in free if mc not in pin_of) + with_pin
+            # parallel expanders chain within groups of 8 macrocells (1-8, 9-16, ...)
+            spot = next((mc for mc in order if set(range(mc - cell.lenders, mc + 1)) <= free
+                         and (mc - 1) // 8 == (mc - 1 - cell.lenders) // 8), None)
+            if spot is None:
+                e = DoesNotFit("no run of %d free macrocells in block %d for %s" % (cell.macrocells, b + 1, cell.name))
+                e.block = b
+                raise e
+            placement[cell.name] = spot
+            free -= set(range(spot - cell.lenders, spot + 1))
     design = netlist.design
     used_pins = set()
     for pin_name in design.outputs:
@@ -216,16 +309,32 @@ def assign_pins(result: Fit, netlist, pin_mc):
             raise DoesNotFit("%s and another output share macrocell %d" % (pin_name, mc))
         port_pin[pin_name] = pin_of[mc]
         used_pins.add(pin_of[mc])
+    for name, pin in fixed.items():
+        if name in design.outputs and port_pin.get(name) != pin:
+            raise DoesNotFit("%s could not be put on its assigned pin %d" % (name, pin))
     spare = [oe2, oe1, gclr, gclk]
     for name, pin in ((result.global_clock, gclk), (result.global_clear.lstrip("!") if result.global_clear else None, gclr)):
         if name:
+            if fixed.get(name, pin) != pin:
+                raise DoesNotFit("%s is the global signal but is assigned to pin %d" % (name, fixed[name]))
             port_pin[name] = pin
             spare.remove(pin)
+    for name, pin in fixed.items():                      # assigned inputs take their pins
+        if name in design.inputs and name not in port_pin:
+            if pin in used_pins or pin in port_pin.values():
+                raise DoesNotFit("pin %d is assigned to %s but already in use" % (pin, name))
+            mc = pin_mc[pin]
+            if mc and mc in placement.values() and mc in [placement.get(_owner(netlist, o)) for o in design.outputs]:
+                raise DoesNotFit("pin %d is assigned to input %s but its macrocell drives an output" % (pin, name))
+            port_pin[name] = pin
+            if pin in spare:
+                spare.remove(pin)
+    taken = set(port_pin.values())
     free = [pin_of[mc] for mc in sorted(pin_of) if pin_of[mc] not in used_pins and mc not in placement.values()]
     free += [pin_of[mc] for mc in sorted(pin_of) if pin_of[mc] not in used_pins and mc in placement.values()
              and pin_of[mc] not in free]
     # buried macrocells' pins come last: using them as inputs costs nothing but is less tidy
-    candidates = free + spare
+    candidates = [p for p in free + spare if p not in taken]
     for name in design.inputs:
         if name in port_pin:
             continue

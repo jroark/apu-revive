@@ -1,0 +1,10 @@
+SUBDESIGN p03_dff_ptclk
+( a, b, d : INPUT;
+  q : OUTPUT; )
+VARIABLE
+	r : DFF;
+BEGIN
+	r.clk = a & b;
+	r.d = d;
+	q = r;
+END;

@@ -399,3 +399,49 @@ def cells_from_reads_160(reads, count: int = LINE_CELLS):
             value = (value << 1) | ((chunk[idx] >> bit) & 1)
         cells[15 - s if count == 16 else count + s // 16 - 5 * (s % 16 + 1)] = value
     return cells
+
+
+# --- EPM7192E in the 160-pin package on the PLMQ7192-160 (module type 0x3e) ----------------------
+# Transcribed from the module's traffic in simulation; same protocol shape again, two port reads
+# per cell.
+READ_PORTS_7192 = (0x0C, 0x0D)
+_CLOCK_7192 = _W(0x06, 0x80, 0x00)
+_PRECHARGE_HEAD_7192 = (_W(0x0B, 0x00) + _W(0x06, 0x00) + _W(0x10, 0x00) + _W(0x11, 0x00) + _W(0x13, 0x00)
+                        + _W(0x07, 0x00) + _W(0x15, 0x00) + _W(0x12, 0x00) + _W(0x14, 0x00))
+_PRECHARGE_BODY_7192 = (_W(0x0E, 0x04, 0x00) * 4
+                        + _W(0x0B, 0x10) + _W(0x06, 0x20) + _W(0x10, 0x41) + _W(0x11, 0x06) + _W(0x13, 0x02)
+                        + _W(0x07, 0x02) + _W(0x15, 0x02) + _W(0x12, 0x10) + _W(0x14, 0x41) + _W(0x0E, 0x04, 0x00))
+
+
+def line_read_ops_7192(row: int, first: bool = True, cells: int = LINE_CELLS, signature: bool = False):
+    short = _delay(4)
+    ops = _delay(DELAY_LONG) if first else _W(0x0B, 0x00) + _W(0x14, 0x00) + _W(0x04, 0x00) + _W(0x0E, 0x00)
+    ops += _W(0x11, 0x00) + _W(0x13, 0x00) + _W(0x0B, 0x00) + _W(0x03, 0x00) + _CLOCK_7192 * 110
+    ops += (_W(0x11, 0x80) + _W(0x13, 0x09) + _W(0x0B, 0x01) + _W(0x03, 0x00)) if row < 128 else \
+        (_W(0x11, 0x00) + _W(0x13, 0x00) + _W(0x0B, 0x00) + _W(0x03, 0x40))
+    ops += _CLOCK_7192 + _W(0x11, 0x00) + _W(0x13, 0x00) + _W(0x0B, 0x00) + _W(0x03, 0x00)
+    ops += _CLOCK_7192 * (row % 128)
+    ops += (_PRECHARGE_HEAD_7192 + _PRECHARGE_BODY_7192) * 16 + _PRECHARGE_HEAD_7192
+    ops += (_W(0x04, 0x80) + _W(0x0E, 0x20)) if signature else _W(0x14, 0x08)
+    ops += _W(0x0D, 0xD0) + short + _W(0x0B, 0x80) + short + _W(0x0D, 0x90)
+    pulse = 0x24 if signature else 0x04
+    for cell in range(cells):
+        ops += [("R", p, None) for p in READ_PORTS_7192]
+        if cell == cells - 1:
+            break
+        if cell % 16 == 15:
+            ops += (_W(0x0B, 0x00) + short + _W(0x0E, pulse, pulse & ~0x04) + short + _W(0x0D, 0xD0) + short
+                    + _W(0x0B, 0x80) + short + _W(0x0D, 0x90))
+        else:
+            ops += _W(0x0D, 0xD0, 0x90)
+    return ops
+
+
+def cells_from_reads_7192(reads, count: int = LINE_CELLS):
+    """Port 0x0C carries cell bits 0-7 and port 0x0D bits 0-3 carry cell bits 8-11 (the EPM7192E's
+    cells are 12 bits wide)."""
+    cells = [0] * count
+    for s in range(count):
+        value = reads[2 * s] | (reads[2 * s + 1] & 0x0F) << 8
+        cells[15 - s if count == 16 else count + s // 16 - 5 * (s % 16 + 1)] = value
+    return cells

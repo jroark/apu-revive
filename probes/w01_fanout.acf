@@ -1,0 +1,14 @@
+CHIP w01_fanout
+BEGIN
+	DEVICE = EPM7064SLC44-10;
+	|a : INPUT_PIN = 4;
+	|b : INPUT_PIN = 26;
+	|ya0 : OUTPUT_PIN = 5;
+	|ya1 : OUTPUT_PIN = 14;
+	|ya2 : OUTPUT_PIN = 24;
+	|ya3 : OUTPUT_PIN = 33;
+	|yb0 : OUTPUT_PIN = 6;
+	|yb1 : OUTPUT_PIN = 16;
+	|yb2 : OUTPUT_PIN = 25;
+	|yb3 : OUTPUT_PIN = 34;
+END;
